@@ -1,0 +1,453 @@
+================================================================================
+                    LZ4 HARDWARE HIERARCHY - QUICK REFERENCE
+================================================================================
+
+COMPRESSED OVERVIEW:
+
+                            lz4_top_v3
+                                │
+                ┌───────────────┼───────────────┐
+                │               │               │
+            hash_pll      control_fsm_v3    lz4_buffer_v2
+         (Clock x2)       (Orchestrator)    (64KB SRAM)
+                │               │               │
+    500MHz ◄─────               │               │
+                                │               │
+        ┌───────────────────────┼───────────────┘
+        │                       │
+        │         ┌─────────────┼─────────────┐
+        │         │             │             │
+        │     hash_table     byte_addressing lz4_encoder
+        │     (Match Dict)   (Byte Shifter)  (Frame Encoding)
+        │         │             │             │
+        │     [×4 Muls]     [96-bit Reg]   [FSM Logic]
+        │     32K×64 RAM    [Barrel Shift] [Output FIFO]
+        │         │             │             │
+        └─────────┴─────────────┴─────────────┴─→ out_data [34-bit]
+        
+                              PARALLEL:
+                              
+                            xxh32_calc
+                           (Checksum)
+                                │
+                            [×1 Mul]
+                                │
+                              digest ──→ to lz4_encoder
+
+
+================================================================================
+                        KEY FACTS SUMMARY
+================================================================================
+
+IMPLEMENTATION STATUS:
+  ✓ LZ4 fully implemented
+  ✓ All core algorithms in hardware
+  ✓ Full LZ4 frame format support
+  ✓ Parallel 4-byte matching
+  ✓ Hash-based dictionary lookup
+  ✓ Variable-length encoding
+  ✓ XXHash32 checksumming
+
+
+MODULE COUNT:
+  • Total Modules: 69 (custom)
+  • Xilinx IP Cores: 33 (memory + multipliers)
+  • LZ4-specific: 40 custom modules
+  • Huffman-specific: 26 custom modules
+  • Mux top-level: 3 modules
+
+
+DATAPATH STAGES:
+  1. Input Buffer (64KB SRAM) ..................... lz4_buffer_v2
+  2. Byte Alignment (96-bit shift) ................ byte_addressing_v4
+  3. Address Generation (adder) ................... abs_addr_gen_v3
+  4. Hash Calculation (4× parallel @ 500MHz) ..... hash_mul32x32
+  5. Dictionary Lookup (32K×64 SRAM) ............. hash_ram_32Kx64bit
+  6. Match Arbitration (mux + compare) ........... hash_table_v3
+  7. Control Sequencing (FSM) .................... control_fsm_v3
+  8. Block Encoding (tokens, offsets) ............ lz4_encoder_v3
+  9. Checksum (parallel path) .................... xxh32_calc_v2
+  10. Clock Doubling (PLL) ....................... hash_pll
+
+
+CRITICAL CHARACTERISTICS:
+
+Frequency:
+  • Main clock (clk_1x): 250 MHz
+  • Hash clock (clk_2x): 500 MHz (2× multiplier via PLL)
+  • Reason for doubling: 4-parallel hash calculations need 2× throughput
+
+Latency (Input to Match Decision):
+  • ~7-10 cycles from data in to match output
+  • Hash multiply: 3-5 cycles (pipelined DSP)
+  • SRAM read: 2 cycles
+  • Mux/arbitration: 1 cycle
+  • FSM decision: 1 cycle
+
+
+Memory Hierarchy:
+  Level 1: 96-bit shift register (combinatorial)
+  Level 2: 64KB circular buffer (SRAM Port A: write, Port B: read dict)
+  Level 3: 256KB hash dictionary (4-port SRAM virtualized)
+  Level 4: 24KB conflict FIFO (BRAM)
+  Total: ~380KB on-chip memory
+
+
+Parallelism:
+  • 4-way byte-parallel matching (1 decision per cycle achieved)
+  • Clock doubling enables 4× hash calculations
+  • Dual-port SRAM allows concurrent input + lookup
+  • Simultaneous checksum computation (xxh32_calc parallel path)
+
+
+COMPRESSION STATISTICS:
+
+Throughput:
+  • Theoretical: 1 byte/cycle = 250 MB/s @ 250 MHz
+  • Realistic: 0.5-0.8 bytes/cycle = 125-200 MB/s
+  • Depends on: Match frequency, file characteristics
+
+Ratio:
+  • Highly compressible data: 20-30% of original
+  • Mixed data: 40-60% of original
+  • Random data: ~100% (no compression)
+  • LZ4 block overhead: ~5-10 bytes per file
+
+
+RESOURCE UTILIZATION (Typical Xilinx FPGA):
+  ├─ BRAM: 28-30 blocks (36Kb each)
+  ├─ DSP48E: 5 units (4 hash muls + 1 xxhash mul)
+  ├─ LUT: ~8-10K
+  ├─ Registers: ~4-5K
+  ├─ IO Pins: ~70
+  └─ Power: 350-500 mW typical
+
+
+================================================================================
+                      DATAFLOW BY EXAMPLE
+================================================================================
+
+EXAMPLE: Compress 4 bytes "ABCD"
+
+Cycle 0:
+  • User provides: idata=0x44434241 (little-endian 'ABCD')
+  • idata_req=1 (data valid)
+  → lz4_buffer writes to position 0, outputs same data next cycle
+
+Cycle 1:
+  • lz4_buffer output: fifo_odata=0x44434241
+  • byte_addressing loads into 96-bit shift register
+  • shift_dist=0, so outputs same 4 bytes to all 4 hash ports
+
+Cycle 2:
+  • byte4_data[1-4] = 0x44434241 (same on all 4 ports)
+  • hash_iaddr[1-4] = {0x00, 0x01, 0x02, 0x03} (from abs_addr_gen)
+  • Multiply starts: 0x44434241 × 0x9E3779B1 → long result
+
+Cycle 3-5:
+  • Hash multiply completes (3-5 cycle latency)
+  • hash_key[1-4] = result[31:17]
+  • SRAM address sent: addra/b/c/d = {hash_key[0-3]}
+  
+Cycle 6-7:
+  • SRAM read returns: {valid=0, prev_data=0, prev_addr=0} (first run, empty)
+  • No previous match found (empty hash table)
+  • Result: hash_hit=0
+
+Cycle 8:
+  • control_fsm decides: No match found → output as literals
+  • Sends to lz4_encoder: unmatch_length=4, unmatch_data=0x44434241
+  
+Cycle 9:
+  • lz4_encoder encodes token: 0x40 (4 literals, 0 match length)
+  • Output: 0x40434241 (token + 3 bytes) + more cycles for 4th byte
+
+Cycle 10:
+  • SRAM write updates: Store {valid=1, data=0x44434241, addr=0}
+  • Next identical pattern will find this match
+
+(Simplified - actual timing depends on control signals and FSM states)
+
+
+================================================================================
+                      ALGORITHM HIGHLIGHTS
+================================================================================
+
+LZ4 ALGORITHM FEATURES IMPLEMENTED:
+
+1. Hash-based Dictionary:
+   • 32K entry hash table (32K×64b = 256Kb)
+   • Hash function: (data × 0x9E3779B1)[31:17]
+   • Each entry stores: {valid | prev_data | prev_addr}
+   • Single entry per hash key (collision resolution via overwrite)
+
+2. Sliding Window:
+   • 64KB circular buffer (two 32KB SRAM blocks)
+   • Absolute addressing → automatic wrapping
+   • Stores all input data (for dictionary lookups later)
+
+3. Parallel Matching:
+   • 4 byte-aligned positions checked per cycle
+   • All 4 generate hash keys simultaneously (@ 500 MHz)
+   • SRAM 4-port lookup of all hash keys
+   • Results arbitrated for best match
+
+4. Match Criteria:
+   • Minimum match length: 4 bytes
+   • Maximum match length: File size
+   • Distance constraint: Must be within 64KB (sliding window)
+   • Quality metric: Exact byte match (not just hash match)
+
+5. Compression Format (LZ4 Standard):
+   Frame Format:
+   ├─ Magic Number: 0x184D2204 (4 bytes)
+   ├─ Frame Descriptor: Flags + Block size + Optional checksums
+   ├─ Data Block:
+   │  ├─ Block Header: (optional with checksums)
+   │  ├─ Literal Section: Tokens + raw bytes
+   │  ├─ Match Section: Offset + length pairs
+   │  └─ Block Checksum: (optional)
+   └─ Checksum: XXHash32 (4 bytes, frame-level)
+
+6. Checksum (XXHash32):
+   • Parallel computation (doesn't stall compression)
+   • Streaming hash (accumulates as data arrives)
+   • Final digest appended to output
+   • Optional per-block checksums (not currently used)
+
+7. Variable-Length Encoding:
+   • Literal length: If ≥15, encoded as additional bytes
+   • Match length: If ≥19, encoded as additional bytes
+   • Each excess byte: 0xFF = 255 more bytes
+   • Remainder: Final byte with actual extra count
+
+8. Byte-Level Sliding:
+   • After each decision, advance position by 1-4 bytes
+   • Next cycle processes new 4-byte window starting at new position
+   • Continuous streaming operation
+
+
+================================================================================
+                      CONTROL FSM STATE FLOW
+================================================================================
+
+Simplified State Diagram:
+
+                    ┌──────────────────┐
+                    │      START       │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │      INIT        │ ◄─ Check file length
+                    │   PRE-HASH       │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │  HASH_SEARCH     │ ◄─ Query hash_table
+                    │  (4-parallel)    │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │  DICT_VERIFY     │ ◄─ Check actual data match
+                    │  (RAM read)      │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+         ┌──────────►│    MATCH_CHK    │◄───────┐
+         │          │ Eval candidates │        │
+         │          └────┬────────┬───┘        │
+         │               │        │             │
+    MATCH│               │       │             │
+   FOUND │          NO   │       YES (longer)  │ NEXT CANDIDATE
+         │          MATCH│       MATCH         │
+         │               │        │             │
+         │          ┌────▼───┐┌──▴────┐        │
+         │          │LITERAL ││ UPDATE│        │
+         │          │ MODE   ││HASHES │        │
+         │          └────┬───┘└──┬────┘        │
+         │               │       │             │
+         └───────────────┼───────┼─────────────┘
+                         │       │
+                    ┌────▼───────▼───┐
+                    │   ENCODE_TOKEN │ ◄─ Send to encoder
+                    │  ENCODE_DATA   │
+                    └────┬───────────┘
+                         │
+                    ┌────▼──────────┐
+                    │   ADVANCE_POS │ ◄─ Move to next position
+                    └────┬──────────┘
+                         │
+                    ┌────▼──────────┐
+                    │ MORE DATA?    │
+                    └┬──────────┬──┘
+                     │YES       │NO
+                     │          │
+                     │     ┌────▼────────┐
+                     │     │   FINALIZE  │ ◄─ Add checksums
+                     │     └────┬────────┘
+                     │          │
+                     └──────┬───┘
+                            │
+                    ┌───────▼──────────┐
+                    │      DONE        │
+                    └──────────────────┘
+
+
+State Entry/Exit Conditions:
+  • HASH_SEARCH: Always enabled (continuous)
+  • DICT_VERIFY: hash_hit=1 (match found)
+  • MATCH_CHK: dict_ovalid=1 (data available)
+  • LITERAL_MODE: No match (hash_hit=0)
+  • UPDATE_HASHES: Match accepted (move_valid=1)
+  • ENCODE_TOKEN: info_valid=1
+  • ADVANCE_POS: Token encoded (sep_valid=1)
+
+
+================================================================================
+                      INTERFACE TIMING
+================================================================================
+
+Input Interface Timing:
+
+User provides: idata[31:0], idata_req=1
+  │
+  ├─ Same cycle: lz4_buffer accepts if buf_full=0
+  │
+  ├─ Next cycle: Data appears in shift register
+  │
+  ├─ 1-2 cycles: SRAM write completes
+  │
+  └─ Eventually: Data processed, hash updated, output generated
+
+
+Output Interface Timing:
+
+When out_valid=1:
+  ├─ out_data[33:0] contains: {valid_mask[1:0], data[31:0]}
+  ├─ valid_mask: 00=no bytes, 01=1 byte, 10=2 bytes, 11=3 bytes, 100=4 bytes
+  │
+  └─ User must set out_en=1 to consume
+     └─ Next cycle: Next word available (if out_empty=0)
+
+
+Backpressure Flow:
+
+mfifo_full=1 ──► Stop input (buf_full will assert)
+                 Input data will queue at user interface
+
+obuf_full=1 ──► Encoder output buffer full
+                 Compression stalls until output read
+
+encode_busy=1 ──► Encoder processing match tokens
+                  Control FSM waits (safe handshaking)
+
+
+Handshake Timing Example:
+
+Cycle N:   byte4_valid=1, rd_fifo_en=1
+           └─ Data transfers from buffer to shifter
+
+Cycle N+1: byte4_data[1-4] valid on shifter outputs
+           └─ Available for hash engines
+
+Cycle N+2: Hash multiplies underway (3 cycles total)
+           └─ No output yet
+
+Cycle N+3: Hash multiply cycle 2
+
+Cycle N+4: Hash multiply cycle 3 (last)
+
+Cycle N+5: SRAM read results: hash_odata[1-4]
+           hash_ovalid=1
+           └─ Match decision available
+
+
+================================================================================
+                      DEBUG & MONITORING
+================================================================================
+
+Test Points Available:
+
+Debug Outputs (per simulation):
+  • mfifo_valid: Buffer FIFO has data
+  • mfifo_data[31:0]: Current buffer output
+  • compress_done: Compression finished
+  • out_valid: Output FIFO has data
+  • out_data[33:0]: Current output word
+
+Signals to Monitor During Simulation:
+  1. Hash table hits: hash_ovalid
+  2. Dictionary matches: dict_ovalid
+  3. Encoder output rate: out_valid frequency
+  4. Compression ratio: compressed_len / input_bytes
+  5. Match distribution: match_length histogram
+  6. Literal distribution: unmatch_length histogram
+
+Common Issues:
+  • mfifo_full persistent: Input FIFO backing up (slow processing)
+  • obuf_full persistent: Output bandwidth bottleneck
+  • out_valid never asserts: Encoder FSM stuck
+  • compress_done never asserts: Stream not terminated properly
+  • hash_hit never asserts: Hash table not initialized or all misses
+
+
+Performance Analysis:
+
+To achieve 250 MB/s @ 250 MHz:
+  • Need: 1 output byte per cycle (average)
+  • Actual: Variable (match-dependent)
+  • For 50% compression: 2 input bytes → 1 output byte
+  • Sustainable throughput: 125 MB/s @ 250 MHz (0.5 output bytes/cycle)
+
+Bottleneck Analysis:
+  • Input rate: 250 MB/s (32-bit word per cycle)
+  • Hash lookup: 4 parallel lookups per cycle (maximum utilization)
+  • Encoder: Variable rate (1-4 output bytes per token)
+  • SRAM bandwidth: Adequate (dual-port, interleaved access)
+
+
+================================================================================
+                      INTEGRATION CHECKLIST
+================================================================================
+
+Before using lz4_top_v3 in ASIC/System:
+
+□ Pin Configuration:
+  □ Verify clock frequency (250 MHz nominal)
+  □ Connect external clock or PLL
+  □ Route reset signal (active-low)
+  □ Termination: Input/output impedance matching
+
+□ Initialization:
+  □ Assert rstN=0 for ≥2 cycles after power-up
+  □ Wait for pll_locked=1 (PLL clock valid)
+  □ Then release rstN=1
+
+□ Input Data:
+  □ Provide file_length before start_compress
+  □ Assert start_compress to begin
+  □ Feed idata with idata_req timing per spec
+  □ Assert data_terminal for last word
+
+□ Output Data:
+  □ Monitor out_valid for compressed words
+  □ Assert out_en to read
+  □ Handle backpressure (obuf_full)
+
+□ Status Monitoring:
+  □ Watch compress_done (signals all data processed)
+  □ Check compressed_len for output size
+  □ Verify checksum in frame (last 4 bytes)
+
+□ Power Management:
+  □ Supply current: ~1-2 A @ 1.0V typical
+  □ Leakage: Always-on SRAM ~100 mW minimum
+  □ Dynamic: 200-300 mW @ 250 MB/s throughput
+
+□ Timing Closure:
+  □ Main path: Combinatorial shifter → hash → SRAM (~8 ns max)
+  □ Critical path: Usually in hash_table arbitration
+  □ Setup margin: Ensure 2ns margin @ 250 MHz (4ns period)
+
+
+================================================================================

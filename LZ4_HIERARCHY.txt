@@ -1,0 +1,369 @@
+================================================================================
+                    LZ4 HARDWARE IMPLEMENTATION HIERARCHY
+================================================================================
+
+TOP LEVEL:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           lz4_top_v3.v (Main Module)                        │
+│  - 32-bit input data stream (idata, idata_req)                              │
+│  - File length input (file_length, file_length_valid)                       │
+│  - 34-bit output compressed data (out_data)                                 │
+│  - Status signals (compress_done, mfifo_full, mfifo_empty)                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                  ┌─────────────────┼─────────────────┐
+                  │                 │                 │
+                  ▼                 ▼                 ▼
+        ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+        │  hash_pll.v      │ │  control_fsm_v3  │ │  lz4_buffer_v2   │
+        │  (Xilinx PLL)    │ │  (FSM Control)   │ │  (Dict Buffer)   │
+        │                  │ │                  │ │                  │
+        │ CLK 250MHz →     │ │ Orchestrates the │ │ Manages 64KB     │
+        │ 500MHz (clk_2x)  │ │ compression      │ │ sliding window   │
+        │                  │ │ pipeline         │ │ dictionary       │
+        └──────────────────┘ └──────────────────┘ └──────────────────┘
+                  │                 │                 │
+                  │                 ▼                 │
+                  │        ┌──────────────────┐      │
+                  │        │  abs_addr_gen_v3 │      │
+                  │        │  (Address Gen)   │      │
+                  │        │                  │      │
+                  │        │ Generates 4      │      │
+                  │        │ parallel addrs   │      │
+                  │        └──────────────────┘      │
+                  │                 │                 │
+                  └────────┬────────┘                 │
+                           │                         │
+        ┌──────────────┬────┴────┬──────────────┐    │
+        │              │         │              │    │
+        ▼              ▼         ▼              ▼    ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ hash_table   │ │ byte_address │ │ lz4_encoder  │ │ xxh32_calc   │
+│   _v3.v      │ │   _ing_v4.v  │ │    _v3.v     │ │    _v2.v     │
+│              │ │              │ │              │ │              │
+│ 4-Parallel   │ │ Input stream │ │ LZ4 Block    │ │ XXHash32     │
+│ Hash Match   │ │ extraction & │ │ Encoding     │ │ Checksum     │
+│ Dict Lookup  │ │ byte shifting│ │ (Tokens,     │ │ Calculation  │
+│              │ │              │ │  literals,   │ │              │
+│              │ │              │ │  offsets)    │ │              │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+        │              │         │              │
+        ▼              ▼         ▼              ▼
+
+
+================================================================================
+                         DETAILED SUBMODULE BREAKDOWN
+================================================================================
+
+1. HASH_TABLE_V3.V (4-Parallel Hash Matching Engine)
+   ├─ Inputs: 4x 32-bit data streams (byte-aligned from shifter)
+   │           4x 32-bit addresses (position in buffer)
+   ├─ Outputs: Match found signal, match address, match distance
+   └─ Internal Submodules:
+      ├─ hash_mul32x32 [×4] (Xilinx IP Core - DSP Multiplier)
+      │  └─ Calculates hash key = (data × 0x9E3779B1)[31:17]
+      ├─ hash_ram_32Kx64bit [×2] (Xilinx BRAM, 4-port)
+      │  └─ Stores: {valid_bit(1) | prev_data(32) | prev_addr(32)}
+      │  └─ Memory: 32K entries × 65 bits = 2Mb per port
+      ├─ hash_4port_32Kx65bit.v (Custom - Multiplexes 4 parallel accesses)
+      │  └─ Arbitrates 4 simultaneous reads and writes
+      ├─ hash_match.v [×2] (Custom - Match Decision Logic)
+      │  └─ Compares data patterns, validates distance constraints
+      └─ shifter_match.v (Custom - Single-byte Shift Matcher)
+         └─ Handles partial byte matching for alignment
+
+
+2. BYTE_ADDRESSING_V4.V (Input Stream Processor)
+   ├─ Inputs: 32-bit aligned data from lz4_buffer FIFO
+   │           Control signals (shift_en, shift_dist)
+   ├─ Outputs: 4× overlapping 32-bit data streams (byte-shifted)
+   │           Validity signals for each stream
+   └─ Implements:
+      ├─ 96-bit shift register (stores 3 × 32-bit dwords)
+      ├─ Combinatorial barrel shifter (extracts 4 shifted views)
+      └─ Custom logic for byte-level alignment
+
+
+3. LZ4_BUFFER_V2.V (Sliding Window Dictionary Management)
+   ├─ Inputs: 32-bit raw input data stream (idata)
+   │           Dictionary read requests (ram_rd, ram_abs_addr)
+   ├─ Outputs: 32-bit FIFO stream to byte_addressing
+   │           32-bit RAM output for dictionary lookup
+   │           Status signals (fifo_empty, buf_full)
+   └─ Internal Submodules:
+      ├─ buffer_ram32Kx32bit [×2] (Xilinx BRAM, 32KB × 32-bit dual-port)
+      │  └─ Total: 64KB circular buffer for sliding window
+      │  └─ Port A: Input write (32-bit)
+      │  └─ Port B: Dictionary read (32-bit)
+      ├─ fifo_512x47bit.v (Xilinx BRAM-based FIFO)
+      │  └─ Conflict handling (RAW/WAW resolution)
+      │  └─ Stores: {address(15) | data(32)}
+      └─ Address conversion logic
+         └─ Converts 32-bit absolute addresses to 15-bit buffer offsets
+
+
+4. ABS_ADDR_GEN_V3.V (Address Generator)
+   ├─ Inputs: Current buffer head address (head_addr)
+   │           Byte increment (incr_bytes - 0 to 7)
+   ├─ Outputs: 4× look-ahead addresses (byte-aligned)
+   └─ Logic: Simple combinatorial addition
+
+
+5. LZ4_ENCODER_V3.V (Block Format Encoder)
+   ├─ State Machine: IDLE → ENCODE_MAGIC → ENCODE_INFO → ENCODE_BLK_LEN
+   │                 → TOKEN → LIT_LEN → LIT → OFFSET → MAT_LEN → ...
+   │                 → XXH32 → ALL_DONE
+   ├─ Inputs: Token info (unmatch_len, match_len, match_offset)
+   │           Raw unmatched data
+   │           Compression control signals
+   ├─ Outputs: 34-bit bitstream (32 data + 2 validity bits)
+   │           Compressed block length
+   └─ LZ4 Frame Format Implementation:
+      ├─ Frame header: Magic (0x184D2204) + Flag (0x64)
+      ├─ Block header: Block size (0 for uncompressed tracking)
+      ├─ Literal section: Variable-length encoded
+      ├─ Match section: Offset (2B, little-endian) + Match length
+      ├─ Block checksum: CRC32
+      └─ Frame checksum: XXHash32
+
+
+6. CONTROL_FSM_V3.V (Main Control FSM)
+   ├─ State Machine (Simplified Flow):
+   │  ├─ INIT: Verify input file length
+   │  ├─ PRE_HASH: Initialize hash table
+   │  ├─ MATCH_SEARCH: Query hash table for best match
+   │  ├─ DICT_ACCESS: Fetch dictionary data for verification
+   │  ├─ ENCODE_DECISION: Select match or literal
+   │  ├─ ENCODE_OUTPUT: Push tokens to encoder
+   │  └─ FINAL: Handle end-of-stream
+   │
+   ├─ Interfaces:
+   │  ├─ TO hash_table: Data/address/control
+   │  ├─ TO byte_addressing: Shift control
+   │  ├─ TO lz4_buffer: Dictionary read requests
+   │  ├─ TO lz4_encoder: Match info (offset, length)
+   │  └─ TO xxh32_calc: Digest request
+   │
+   └─ 1714 lines of complex FSM logic
+
+
+7. XXH32_CALC_V2.V (Hash Checksum)
+   ├─ Implements XXHash32 algorithm
+   ├─ Inputs: Data stream (32-bit), length, control signals
+   ├─ Outputs: 32-bit digest (checksum)
+   └─ Internal:
+      └─ xxh32_mul.v (Xilinx IP - 32×32 DSP Multiplier)
+         └─ Used for XOR-rotated multiplications
+
+
+================================================================================
+                         DATA FLOW ARCHITECTURE
+================================================================================
+
+Input Data Stream (32-bit words)
+         │
+         ▼
+   ┌──────────────────────┐
+   │  lz4_buffer_v2       │ ◄─── Previous data (dict)
+   │  (64KB BRAM FIFO)    │
+   │                      │
+   │ Output: 32-bit words │
+   └──────────┬───────────┘
+              │
+              ▼
+   ┌──────────────────────────────────┐
+   │  byte_addressing_v4              │ ◄─── shift_en, shift_dist
+   │  (Barrel Shifter)                │      (from control_fsm)
+   │                                  │
+   │ Output: 4× parallel byte streams │
+   │  (byte0..byte3, byte1..byte4,    │
+   │   byte2..byte5, byte3..byte6)    │
+   └──────────────┬────────────────────┘
+                  │
+    ┌─────────────┼─────────────┐
+    │             │             │
+    ▼             ▼             ▼
+  ┌──────────────────────────────────────┐
+  │     hash_table_v3                    │
+  │  (4-Parallel Hash Dictionary)        │
+  │                                      │
+  │  Input: 4× data + 4× addresses       │
+  │  Output: Match found? + match addr   │
+  │  Memory: hash_ram_32Kx64bit [×2]    │
+  │         (4 parallel ports via mux)   │
+  └──────────────┬───────────────────────┘
+                 │
+    (Match decision from control_fsm)
+                 │
+                 ▼
+  ┌──────────────────────────────────────┐
+  │     lz4_encoder_v3                   │
+  │  (Block Format Encoder)              │
+  │                                      │
+  │  Encodes LZ4 block format            │
+  │  Output: 34-bit compressed bitstream │
+  └──────────────┬───────────────────────┘
+                 │
+                 ▼
+            Compressed Output (34-bit)
+
+
+================================================================================
+                    CLOCK DOMAIN & TIMING
+================================================================================
+
+Clock Tree:
+  Input clk (250 MHz)
+    │
+    ├─► CLK_250 (clk_1x) → Most modules (FSM, encoders)
+    │
+    └─► CLK_500 (clk_2x) → hash_table_v3 (4-parallel hash calculation)
+                            (requires 2× clock for parallel ops)
+
+Critical Path Considerations:
+  • Hash calculation @ 500MHz (2 ns cycle)
+  • Barrel shifter combinatorial (< 1 ns)
+  • Match evaluation (~3 ns)
+  • FSM state transition @ 250MHz (4 ns cycle)
+  • Output serialization @ 250MHz
+
+
+================================================================================
+                         XILINX IP CORES USED
+================================================================================
+
+Memory/Storage (14 instances):
+  ├─ buffer_ram32Kx32bit [×2]      (64KB total, dual-port, BRAM)
+  ├─ hash_ram_32Kx64bit [×2]       (256KB total, 4-port, BRAM)
+  ├─ fifo_512x47bit [×1]           (Conflict handling FIFO)
+  └─ Other FIFOs in encoder
+
+DSP Multipliers (2 instances):
+  ├─ hash_mul32x32 [×4]            (Hash calculation)
+  └─ xxh32_mul                      (XXHash multiplication)
+
+Clock Management (1 instance):
+  └─ hash_pll                       (250MHz → 500MHz)
+
+
+================================================================================
+                       KEY DESIGN PATTERNS
+================================================================================
+
+1. PIPELINING STRATEGY:
+   - Stage 1: Barrel shifter produces 4 parallel data streams
+   - Stage 2: 4 hash multiplications in parallel (pipelined in DSP)
+   - Stage 3: SRAM lookup (32K × 4 accesses per cycle)
+   - Stage 4: Match arbitration and selection
+   - Total latency: ~8-10 cycles from input to match decision
+
+2. PARALLELISM:
+   - 4-way byte-parallel matching (processes 4 potential matches per cycle)
+   - Clock doubling enables 4× hash calculation per input clock
+   - Dual-port BRAM allows simultaneous input + dictionary lookup
+
+3. CIRCULAR BUFFER MANAGEMENT:
+   - Address wrapping @ 64KB boundary
+   - Conflict detection when write catches up with read
+   - FIFO-based conflict resolution (512× entries)
+
+4. STATE-BASED CONTROL:
+   - Hierarchical FSM (control_fsm_v3 orchestrates others)
+   - Each module has independent FSM (hash_table, lz4_buffer, lz4_encoder)
+   - Handshake signals for inter-module synchronization
+
+
+================================================================================
+                        INSTANCE COUNTS
+================================================================================
+
+Top-Level Instantiations in lz4_top_v3.v:
+  ├─ control_fsm_v3              [1]  (1714 lines)
+  ├─ byte_addressing_v4          [1]  (554 lines)
+  ├─ abs_addr_gen_v3             [1]  (56 lines)
+  ├─ hash_table_v3               [1]  (707 lines) ◄─ Complex!
+  ├─ lz4_encoder_v3              [1]  (972 lines) ◄─ Largest!
+  ├─ lz4_buffer_v2               [1]  (721 lines) ◄─ Complex!
+  ├─ xxh32_calc_v2               [1]  (1254 lines)
+  └─ hash_pll                    [1]  (Xilinx IP)
+
+hash_table_v3 Sub-Instances:
+  ├─ hash_mul32x32               [4]  (Xilinx IP - Multipliers)
+  ├─ hash_ram_32Kx64bit          [2]  (Xilinx IP - BRAM)
+  ├─ hash_4port_32Kx65bit        [1]  (Custom - SRAM access logic)
+  ├─ hash_match                  [2]  (Custom - Match evaluation)
+  └─ shifter_match               [1]  (Custom - Byte shift matching)
+
+lz4_buffer_v2 Sub-Instances:
+  ├─ buffer_ram32Kx32bit         [2]  (Xilinx IP - BRAM)
+  └─ fifo_512x47bit              [1]  (Xilinx IP - BRAM FIFO)
+
+lz4_encoder_v3 Sub-Instances:
+  ├─ (No sub-modules, pure logic FSM)
+
+Total Custom Logic Modules: ~40
+Total Xilinx IP Blocks: 19 (in LZ4 path alone)
+
+================================================================================
+                      SIGNAL HANDSHAKING PROTOCOL
+================================================================================
+
+Ready/Valid Handshake Pattern Used Throughout:
+  • Input valid (xxxxx_valid or xxxxx_req) indicates data ready
+  • Output ready (xxxxx_en or xxxxx_rd) indicates receiver ready
+  • Transaction occurs when both valid AND ready asserted
+  • No back-pressure stalling within pipelines
+
+
+Example: lz4_buffer → byte_addressing
+  • fifo_ovalid: Buffer has data
+  • rd_fifo_en: Shifter ready
+  • Transaction: Both high → data transfers
+
+
+Example: hash_table → encoder
+  • hash_ovalid: Match result ready
+  • (Next FSM state): Encoder ready
+  • info_valid: FSM→encoder communication
+
+================================================================================
+                      MODULE DEPENDENCIES
+================================================================================
+
+Dependency Graph (→ means "depends on"):
+
+  lz4_top_v3
+    ├─→ control_fsm_v3 (orchestrator)
+    │    ├─→ byte_addressing_v4 (controls shifter)
+    │    ├─→ hash_table_v3 (drives match search)
+    │    ├─→ lz4_buffer_v2 (controls dict access)
+    │    ├─→ lz4_encoder_v3 (provides match info)
+    │    └─→ xxh32_calc_v2 (requests checksum)
+    │
+    ├─→ hash_table_v3
+    │    ├─→ hash_mul32x32 [×4] (hash calculation)
+    │    ├─→ hash_ram_32Kx64bit [×2] (SRAM)
+    │    ├─→ hash_4port_32Kx65bit (SRAM mux)
+    │    ├─→ hash_match [×2] (match logic)
+    │    └─→ shifter_match (byte matching)
+    │
+    ├─→ byte_addressing_v4
+    │    └─→ (Pure combinatorial logic + shift registers)
+    │
+    ├─→ abs_addr_gen_v3
+    │    └─→ (Pure combinatorial logic)
+    │
+    ├─→ lz4_buffer_v2
+    │    ├─→ buffer_ram32Kx32bit [×2] (SRAM)
+    │    └─→ fifo_512x47bit (conflict FIFO)
+    │
+    ├─→ lz4_encoder_v3
+    │    └─→ (Pure FSM + logic)
+    │
+    ├─→ xxh32_calc_v2
+    │    └─→ xxh32_mul (DSP multiplier)
+    │
+    └─→ hash_pll
+         └─→ (Clock generation)
+
+================================================================================

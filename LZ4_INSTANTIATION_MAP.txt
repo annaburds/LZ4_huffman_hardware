@@ -1,0 +1,490 @@
+================================================================================
+                        LZ4 MODULE INSTANTIATION MAP
+================================================================================
+
+This document shows the actual instantiation structure and port connections.
+
+================================================================================
+                    lz4_top_v3.v (Main Module)
+================================================================================
+
+MODULE HIERARCHY:
+
+lz4_top_v3
+ ├─ [U_control_fsm] control_fsm_v3.v
+ │   Purpose: Main compression FSM - orchestrates all sub-modules
+ │   Lines: 1714
+ │
+ ├─ [U_byte_addressing] byte_addressing_v4.v
+ │   Purpose: Input stream barrel shifter (96-bit)
+ │   Lines: 554
+ │
+ ├─ [U_abs_addr_gen] abs_addr_gen_v3.v
+ │   Purpose: Address generator (combinatorial adders for 4 parallel addrs)
+ │   Lines: 56
+ │
+ ├─ [U_hash_table] hash_table_v3.v
+ │   Purpose: 4-parallel hash match engine with 32Kx64 SRAM
+ │   Lines: 707
+ │   Sub-modules (inside hash_table_v3):
+ │    ├─ [U_hash_mul1] hash_mul32x32 (Xilinx IP)
+ │    ├─ [U_hash_mul2] hash_mul32x32 (Xilinx IP)
+ │    ├─ [U_hash_mul3] hash_mul32x32 (Xilinx IP)
+ │    ├─ [U_hash_mul4] hash_mul32x32 (Xilinx IP)
+ │    │   Each multiplies incoming data by 0x9E3779B1 @ 500MHz
+ │    │
+ │    ├─ hash_ram_32Kx64bit (Xilinx IP BRAM - 2 blocks)
+ │    │   Stores {valid(1) | data(32) | addr(32)} per entry
+ │    │   4-port access virtualized via hash_4port_32Kx65bit mux
+ │    │
+ │    ├─ hash_4port_32Kx65bit.v (Custom logic)
+ │    │   Arbitrates 4 simultaneous read/write requests to dual-port BRAM
+ │    │
+ │    ├─ hash_match.v [2 instances]
+ │    │   Evaluates match validity (data pattern match, distance check)
+ │    │
+ │    └─ shifter_match.v
+ │        Handles byte-level shifting for partial matches
+ │
+ ├─ [U_lz4_buffer] lz4_buffer_v2.v
+ │   Purpose: 64KB circular sliding window + input FIFO
+ │   Lines: 721
+ │   Sub-modules (inside lz4_buffer_v2):
+ │    ├─ buffer_ram32Kx32bit [2 instances] (Xilinx IP BRAM)
+ │    │   Total: 32KB + 32KB = 64KB
+ │    │   Dual-port: Port A (write), Port B (read dictionary)
+ │    │   Address width: 15-bit (addresses 0-32767)
+ │    │   Data width: 32-bit
+ │    │
+ │    └─ fifo_512x47bit (Xilinx IP - BRAM-based FIFO)
+ │        Stores read-after-write conflict data
+ │        Entries: 512 × 47-bit = ~24 KB equivalent
+ │        Entry format: {ram_addr[14:0], ram_data[31:0]}
+ │
+ ├─ [U_lz4_encoder] lz4_encoder_v3.v
+ │   Purpose: LZ4 block format encoder (magic, tokens, offsets, checksums)
+ │   Lines: 972
+ │   No sub-module instantiations (pure combinatorial + FSM logic)
+ │   Implements state machine for:
+ │    ├─ Frame header generation
+ │    ├─ Block headers
+ │    ├─ Token encoding
+ │    ├─ Literal section encoding
+ │    ├─ Match offset/length encoding
+ │    ├─ XXHash32 value encoding
+ │    └─ End-of-stream marker
+ │
+ ├─ [U_xxh32_calc] xxh32_calc_v2.v
+ │   Purpose: XXHash32 algorithm for frame checksum
+ │   Lines: 1254
+ │   Sub-modules (inside xxh32_calc_v2):
+ │    └─ xxh32_mul (Xilinx IP - 32×32 DSP Multiplier)
+ │        Used for hash state updates via multiply operations
+ │
+ └─ [U_pll_250_to_500] hash_pll.v
+     Purpose: Clock multiplier (250 MHz → 500 MHz)
+     Type: Xilinx IP (PLL/MMCM)
+     Generates:
+     ├─ CLK_250 (clk_1x) → Most logic runs here
+     └─ CLK_500 (clk_2x) → Hash table multipliers for 4× speedup
+
+
+================================================================================
+                        SIGNAL CONNECTIONS
+================================================================================
+
+Input Data Path:
+================================================================================
+
+User Input (idata[31:0], idata_req) 
+  │
+  ├──→ [lz4_buffer_v2]
+  │    └─ Writes to buffer_ram32Kx32bit (Port A)
+  │    └─ Output: fifo_odata[31:0] + fifo_ovalid
+  │
+  ├──→ Output path: fifo_odata[31:0]
+  │
+  └──→ [byte_addressing_v4]
+       ├─ Input: fifo_odata[31:0]
+       ├─ Control: byte4_en, shift_dist, shift_en (from control_fsm)
+       └─ Output: 4× parallel shifted streams
+          ├─ byte4_data1[31:0]  ← bytes [63:32] of 96-bit buffer
+          ├─ byte4_data2[31:0]  ← bytes [55:24] of 96-bit buffer
+          ├─ byte4_data3[31:0]  ← bytes [47:16] of 96-bit buffer
+          └─ byte4_data4[31:0]  ← bytes [39:8] of 96-bit buffer
+
+
+Hash/Match Path:
+================================================================================
+
+4 Parallel Data Streams → [hash_table_v3]
+├─ Port 1: hash_idata1[31:0], hash_iaddr1[31:0], hash_ivalid1
+├─ Port 2: hash_idata2[31:0], hash_iaddr2[31:0], hash_ivalid2
+├─ Port 3: hash_idata3[31:0], hash_iaddr3[31:0], hash_ivalid3
+└─ Port 4: hash_idata4[31:0], hash_iaddr4[31:0], hash_ivalid4
+
+Inside hash_table_v3:
+
+Step 1: Hash Calculation (@ 500 MHz via clk_2x)
+  ├─ hash_mul1: {hash_idata1 × 0x9E3779B1} → temp_hash1[63:0]
+  ├─ hash_mul2: {hash_idata2 × 0x9E3779B1} → temp_hash2[63:0]
+  ├─ hash_mul3: {hash_idata3 × 0x9E3779B1} → temp_hash3[63:0]
+  └─ hash_mul4: {hash_idata4 × 0x9E3779B1} → temp_hash4[63:0]
+  
+  Results: hash_key[1-4] = temp_hash[31:17]  (3-5 cycle latency)
+
+Step 2: SRAM Lookup (hash_ram_32Kx64bit)
+  ├─ RAM Address: hash_key[14:0] (15-bit address → 32K entries)
+  ├─ Read Output (2 cycle latency):
+  │  ├─ ram_douta[64:0] → {valid | prev_data | prev_addr}
+  │  ├─ ram_doutb[64:0]
+  │  ├─ ram_doutc[64:0]
+  │  └─ ram_doutd[64:0]
+  │
+  └─ Write Update (simultaneous):
+     ├─ ram_addra, ram_dina[64:0], ram_wea
+     ├─ ram_addrb, ram_dinb[64:0], ram_web
+     ├─ ram_addrc, ram_dinc[64:0], ram_wec
+     └─ ram_addrd, ram_dind[64:0], ram_wed
+     
+     Each write: {1'b1 | current_data[31:0] | current_addr[31:0]}
+
+Step 3: Match Arbitration
+  ├─ hash_4port_32Kx65bit (mux logic)
+  ├─ hash_match [×2] evaluation engines
+  └─ shifter_match fallback logic
+
+Output from hash_table_v3:
+├─ hash_hit (1-bit)            → Match found?
+├─ hash_oaddr[31:0]            → Address of previous match
+├─ hit_dist[31:0]              → Distance (current - previous)
+├─ hit_status[2:0]             → Match quality
+└─ hash_ovalid (1-bit)         → Result valid
+
+
+Control Flow Path:
+================================================================================
+
+[control_fsm_v3] - The Orchestrator
+
+Input Signals Received:
+├─ From byte_addressing: byte4_data1-4, byte4_valid, byte4_busy
+├─ From hash_table:      hash_hit, hash_oaddr, hit_dist, hash_ovalid
+├─ From lz4_buffer:      mfifo_count, mfifo_valid, mfifo_data, fifo_empty
+├─ From lz4_encoder:     encode_done, encode_busy, seg_done
+├─ From xxh32_calc:      digest, digest_valid
+└─ External:             file_length, file_length_valid, compress_done
+
+Output Control Signals Generated:
+├─ To byte_addressing: rd_data_en, byte4_en, shift_en, shift_dist[2:0]
+├─ To hash_table:      hash_clean, hash_unable (status feedback)
+├─ To lz4_buffer:      dict_rd, dict_abs_addr
+├─ To lz4_encoder:     match_offset[15:0], match_length[31:0],
+│                      unmatch_length[31:0], unmatch_data[31:0],
+│                      info_valid, ignore_offset, encode_en
+└─ Status output:      compress_done
+
+FSM States (Simplified):
+├─ INIT → Initialize
+├─ HASH_SEARCH → Query hash table for matches
+├─ VERIFY → Fetch dictionary data (ram_rd from buffer)
+├─ DECIDE → Choose match vs literal
+├─ ENCODE_PUSH → Send token to encoder
+└─ FINAL → Handle end-of-stream
+
+
+Encoding Output Path:
+================================================================================
+
+[lz4_encoder_v3] Inputs:
+├─ blocksize_id[7:0]            ← From control_fsm (LZ4 frame param)
+├─ header_crc[7:0]              ← From control_fsm (CRC of header)
+├─ head_valid                   ← Frame header trigger
+├─ match_offset[15:0]           ← From control_fsm (little-endian)
+├─ match_length[31:0]           ← From control_fsm (≥4 for match)
+├─ unmatch_length[31:0]         ← From control_fsm (literal count)
+├─ unmatch_data[31:0]           ← From control_fsm (literal bytes)
+├─ info_valid                   ← Token is valid
+├─ ignore_offset                ← Literal-only token
+├─ xxh32_dword[31:0]            ← From xxh32_calc (frame checksum)
+├─ encode_en                    ← Enable this FSM
+├─ compress_start               ← Start token
+└─ compress_done                ← End token
+
+[lz4_encoder_v3] Outputs:
+├─ out_data[33:0]               → {valid_mask[1:0] | data[31:0]}
+├─ out_valid                    → Has compressed data
+├─ out_empty                    → FIFO empty
+├─ obuf_full                    → Output buffer full
+├─ ohalf_full                   → Output buffer at 50%
+├─ compressed_len[31:0]         → Total bytes encoded
+├─ encode_done                  → All encoding complete
+├─ encode_busy                  → FSM busy
+├─ seg_done                     → Block complete
+└─ fifo_count[12:0]             → Output FIFO occupancy
+
+
+Checksum Path (Parallel):
+================================================================================
+
+[xxh32_calc_v2] - Independent Data Stream
+
+Inputs:
+├─ data[31:0]                   ← Raw input (idata)
+├─ data_valid                   ← Input valid (idata_req)
+├─ compress_start               ← Start hash
+├─ compress_done                ← End hash
+├─ length[31:0]                 ← Total file length
+└─ length_valid                 ← Length valid
+
+Internal:
+├─ State machine for XXHash32 algorithm
+├─ Multiple rounds of:
+│  ├─ Multiply via xxh32_mul (DSP)
+│  ├─ XOR with state
+│  └─ Rotate operations
+└─ Accumulation across entire input stream
+
+Output:
+├─ digest[31:0]                 → Final XXHash32 value
+└─ digest_valid                 → Hash complete
+
+
+Dictionary Lookup Path:
+================================================================================
+
+[control_fsm_v3] → [lz4_buffer_v2]
+
+Control Signals:
+├─ dict_rd (1-bit)              → Initiate dictionary read
+├─ dict_abs_addr[31:0]          → Address in sliding window
+└─ move_dist[2:0]               → Update position by N bytes
+
+[lz4_buffer_v2] Returns:
+├─ dict_odata[31:0]             → Data at requested address
+├─ dict_ovalid (1-bit)          → Data valid
+└─ outofrange (1-bit)           → Address outside valid window
+
+
+Status & Handshake Signals:
+================================================================================
+
+Handshake Protocol (All modules use this pattern):
+
+Valid/Ready Pattern:
+  Module A → Module B:
+  ├─ xxx_valid (from A)        ← Indicates A has data ready
+  ├─ xxx_en / xxx_rd (from B)  ← Indicates B is ready to accept
+  └─ Transaction when: valid AND ready/enable
+
+Example: byte_addressing → hash_table
+  ├─ byte4_valid (output from shifter)
+  ├─ (no explicit ready - hash_table always ready post-reset)
+  └─ Data flows every cycle when valid=1
+
+Example: lz4_buffer FIFO → byte_addressing
+  ├─ fifo_ovalid (from buffer)
+  ├─ rd_fifo_en (from shifter)
+  └─ Transaction when both high
+
+
+Stall/Flow Control:
+  ├─ byte4_busy (→ inhibit shifter output)
+  ├─ buf_full (→ stop input writing)
+  ├─ obuf_full (→ halt encoder)
+  ├─ mfifo_full (→ halt buffer input)
+  └─ encode_busy (→ stop feeding encoder)
+
+
+================================================================================
+                    XILINX IP CORE PORT DETAILS
+================================================================================
+
+hash_mul32x32 (32×32 Multiplier, IP Core)
+Inputs:
+  ├─ clk              Clock (500 MHz domain)
+  ├─ sclr             Synchronous clear (from ~rstN)
+  ├─ a[31:0]         First operand (constant: 0x9E3779B1)
+  └─ b[31:0]         Second operand (data to hash)
+
+Outputs:
+  └─ p[63:0]         Product (result)
+
+Latency: 3-5 cycles (pipelined in DSP48E primitive)
+
+
+hash_ram_32Kx64bit (32K×64 Dual-Port BRAM, IP Core)
+Port A (Write-dominant):
+  ├─ clka             Clock A
+  ├─ wea              Write enable A
+  ├─ addra[14:0]      Address A (15-bit → 32K entries)
+  ├─ dina[63:0]       Data in A (65-bit: {valid|data|addr})
+  └─ douta[63:0]      Data out A (registered, 2-cycle latency)
+
+Port B (Read-dominant):
+  ├─ clkb             Clock B
+  ├─ web              Write enable B
+  ├─ addrb[14:0]      Address B
+  ├─ dinb[63:0]       Data in B
+  └─ doutb[63:0]      Data out B (registered, 2-cycle latency)
+
+(Ports C and D similar - virtualized through logic mux)
+
+
+buffer_ram32Kx32bit (32K×32 Dual-Port BRAM, IP Core)
+Port A (Input write):
+  ├─ clka             Clock A (250 MHz)
+  ├─ wea              Write enable A
+  ├─ addra[14:0]      Write address (32K entries)
+  ├─ dina[31:0]       Input data (32 bits)
+  └─ douta[31:0]      (not used)
+
+Port B (Dictionary read):
+  ├─ clkb             Clock B (250 MHz)
+  ├─ web              (tied to 0 - no write)
+  ├─ addrb[14:0]      Read address from control_fsm
+  ├─ dinb[31:0]       (not used)
+  └─ doutb[31:0]      Dictionary output (2-cycle latency)
+
+
+fifo_512x47bit (512×47 BRAM FIFO, IP Core)
+Inputs:
+  ├─ clk              Clock (250 MHz)
+  ├─ rst              Reset
+  ├─ din[46:0]        Write data {addr[14:0], data[31:0]}
+  ├─ wr_en            Write enable
+  └─ rd_en            Read enable
+
+Outputs:
+  ├─ dout[46:0]       Read data
+  ├─ full             FIFO full (512 entries used)
+  ├─ empty            FIFO empty
+  ├─ data_count       Occupancy counter
+  └─ prog_full        Programmable full threshold
+
+
+hash_pll (PLL/MMCM Clock Generator, IP Core)
+Inputs:
+  ├─ CLK_IN          Input clock (250 MHz)
+  └─ RESET            Reset
+
+Outputs:
+  ├─ CLK_250         Output 250 MHz (clk_1x)
+  ├─ CLK_500         Output 500 MHz (clk_2x)
+  └─ LOCKED          PLL locked indicator
+
+
+xxh32_mul (32×32 Multiplier, IP Core - Similar to hash_mul32x32)
+Used inside xxh32_calc_v2 for hash state updates.
+
+
+================================================================================
+                    VERILOG MODULE DEFINITIONS
+================================================================================
+
+Top-level module declaration:
+
+module lz4_top_v3(
+  // Global clock and reset
+  input wire                clk,
+  input wire                rstN,
+  
+  // Data input
+  input wire [31:0]         idata,
+  input wire                idata_req,
+  input wire                data_terminal,
+  input wire                start_compress,
+  
+  // File length
+  input wire [31:0]         file_length,
+  input wire                file_length_valid,
+  
+  // Data output
+  input wire                out_en,
+  output wire [33:0]        out_data,         // {valid_mask[1:0], data[31:0]}
+  output wire               out_empty,
+  output wire               out_valid,
+  output wire               obuf_full,
+  output wire               ohalf_full,
+  output wire [31:0]        compressed_len,
+  
+  // Status
+  output wire               mfifo_full,
+  output wire               mfifo_empty,
+  output wire               compress_done,
+  
+  // Debug ports
+  output wire               mfifo_valid,
+  output wire [31:0]        mfifo_data
+);
+
+
+Sub-module instantiation pattern:
+
+module_name  instance_name(
+  // Port connections
+  .port_name  (signal_name),
+  .port_name  (signal_name),
+  ...
+);
+
+
+Example - Hash table instantiation:
+
+hash_table_v3 U_hash_table(
+  // Clocks
+  .clk         (clk_1x),
+  .clk_2x      (clk_2x),
+  .rstN        (rstN & pll_locked),
+  
+  // 4 parallel input ports
+  .hash_idata1 (hash_idata1),
+  .hash_iaddr1 (hash_iaddr1),
+  .hash_ivalid1(hash_ivalid1),
+  // ... (repeat for ports 2, 3, 4) ...
+  
+  // Match output
+  .hash_hit    (hash_hit),
+  .hit_dist    (hit_dist),
+  .hash_oaddr  (hash_oaddr),
+  .hash_ovalid (hash_ovalid)
+);
+
+
+================================================================================
+                    DESIGN PATTERNS & CONVENTIONS
+================================================================================
+
+Naming Conventions:
+├─ Signal names: lowercase_with_underscores
+├─ Module names: CamelCase (e.g., control_fsm_v3)
+├─ Instance names: U_descriptive_name
+├─ Parameters: UPPERCASE_WITH_UNDERSCORES
+├─ Valid signals: suffixed with _valid
+├─ Enable signals: suffixed with _en
+├─ Read/write: rd_xxx, wr_xxx
+└─ Module versions: _v1, _v2, _v3, _v4 (iteration tracking)
+
+Clock Domain Annotations:
+├─ clk_1x (250 MHz): Main compression pipeline
+└─ clk_2x (500 MHz): Hash calculation stage only
+
+Reset Strategy:
+├─ Global rstN: Active-low asynchronous reset
+├─ AND'd with pll_locked: Ensures PLL stable before operation
+└─ Applied to all state machines and registers
+
+FSM Coding Style:
+├─ Separate always blocks: Next state logic & output logic
+├─ Parameters for state definitions
+├─ case statements for state decoding
+└─ Default cases for safety
+
+Parameterization:
+├─ Buffer sizes: Hardcoded in instantiation (lz4_buffer_v2)
+├─ Hash table size: 32K entries (fixed in hash_ram_32Kx64bit)
+├─ FIFO depths: Various (512, 4K, 8K)
+└─ Feature flags: Ifdef directives for debug modes
+
+
+================================================================================

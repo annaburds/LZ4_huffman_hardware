@@ -1,0 +1,568 @@
+================================================================================
+                    LZ4 MODULE HIERARCHY - XILINX vs CUSTOM
+================================================================================
+
+Legend:
+  [X] = Xilinx IP Core (Memory, DSP, Clock, FIFO)
+  [C] = Custom Logic (Verilog you can modify/port)
+  ★   = Critical/Complex module
+  ■   = Top-level entry point
+
+================================================================================
+                          COMPLETE HIERARCHY TREE
+================================================================================
+
+                                ■[C]
+                            lz4_top_v3.v
+                              (372 lines)
+                                  │
+              ┌───────────────────┼───────────────────┐
+              │                   │                   │
+         ┌────▼─────┐        ┌────▼─────┐      ┌─────▼──────┐
+         │  [X]     │        │   [C]    │      │   [C]      │
+         │hash_pll  │        │control   │      │lz4_buffer  │
+         │          │        │_fsm_v3   │      │_v2         │
+         │Clock x2  │        │          │      │            │
+         │250→500MHz│        │1714 lines│      │721 lines   │
+         │          │        │★★★       │      │★★          │
+         └────┬─────┘        └────┬─────┘      └─────┬──────┘
+              │                   │                   │
+         clk_1x              Command Center      64KB SRAM
+         clk_2x              Orchestrator        Sliding Window
+                             Main FSM            Input Buffer
+                                                 
+                                 │
+                ┌────────────────┼────────────────┐
+                │                │                │
+           ┌────▼─────┐     ┌────▼─────┐    ┌────▼──────┐
+           │   [C]    │     │   [C]    │    │    [C]    │
+           │hash_     │     │byte_     │    │lz4_       │
+           │table_v3  │     │addressing│    │encoder_v3 │
+           │          │     │_v4       │    │           │
+           │707 lines │     │554 lines │    │972 lines  │
+           │★★★       │     │          │    │★★         │
+           └────┬─────┘     └────┬─────┘    └────┬──────┘
+                │                │               │
+      ┌─────────┼─────────┐      │               │
+      │         │         │      │               │
+    ┌─▼──┐ ┌───▼──┐ ┌────▼─┐    │           ┌───▼────┐
+    │[X] │ │[X]   │ │[C]   │    │           │[X]    │
+    │hash│ │hash_ │ │shifter   │           │Encoder│
+    │mul │ │ram   │ │_match    │           │FIFO   │
+    │32x │ │32Kx  │ │.v        │           │       │
+    │32  │ │64bit │ │          │           │       │
+    │[×4]│ │[×2]  │ └────┬─────┘           └───────┘
+    └────┘ └──────┘      │
+                    ┌─────▼─────┐
+                    │    [C]    │
+                    │hash_4port │
+                    │_32Kx65bit │
+                    │           │
+                    │Arbitrator │
+                    └─────┬─────┘
+                          │
+                    ┌─────┴─────┐
+                    │           │
+                ┌───▼──┐   ┌────▼──┐
+                │[C]   │   │[C]    │
+                │hash_ │   │hash_  │
+                │match │   │match  │
+                │.v    │   │.v     │
+                │[×2]  │   │       │
+                └──────┘   └───────┘
+                
+                
+        ┌────────────────────────────────────┐
+        │     [C]                            │
+        │  abs_addr_gen_v3                   │
+        │  (56 lines)                        │
+        │  Address Generator                 │
+        │  (connects to hash_table)          │
+        └────────────────────────────────────┘
+
+
+        ┌────────────────────────────────────┐
+        │     [C]                            │
+        │  xxh32_calc_v2                     │
+        │  (1254 lines)                      │
+        │  Checksum Calculator (Parallel)    │
+        │                                    │
+        │  Contains:                         │
+        │    └─[X] xxh32_mul (Multiplier)   │
+        └────────────────────────────────────┘
+
+
+INSIDE lz4_buffer_v2.v [C]:
+================================================================================
+
+lz4_buffer_v2  [C]
+    │
+    ├─ [X] buffer_ram32Kx32bit [×2]
+    │   ├─ Instance 1: 32K × 32-bit SRAM (Port A: write, Port B: read)
+    │   └─ Instance 2: 32K × 32-bit SRAM (duplicate)
+    │       Total: 64KB sliding window
+    │       Type: Xilinx BRAM (Block RAM)
+    │       Latency: 1-2 cycles registered output
+    │
+    └─ [X] fifo_512x47bit [×1]
+        │
+        ├─ Conflict resolution FIFO
+        ├─ Stores read-after-write hazard data
+        ├─ Format: {addr[14:0], data[31:0]} = 47 bits
+        ├─ Depth: 512 entries
+        ├─ Type: Xilinx BRAM-based FIFO
+        └─ Latency: 1-2 cycles
+
+
+INSIDE hash_table_v3.v [C]:
+================================================================================
+
+hash_table_v3  [C]
+    │
+    ├─ Hash Multipliers (Calculation Stage)
+    │  │
+    │  ├─ [X] hash_mul32x32 [×4]
+    │  │   ├─ Instance 1: 32×32 multiply (data₁ × 0x9E3779B1)
+    │  │   ├─ Instance 2: 32×32 multiply (data₂ × 0x9E3779B1)
+    │  │   ├─ Instance 3: 32×32 multiply (data₃ × 0x9E3779B1)
+    │  │   └─ Instance 4: 32×32 multiply (data₄ × 0x9E3779B1)
+    │  │       Clock: clk_2x (500 MHz)
+    │  │       Latency: 3-5 cycles
+    │  │       Type: Xilinx DSP48E multiplier
+    │  │
+    │  └─ Output: hash_key[1-4] = multiply_result[31:17]
+    │
+    ├─ Dictionary Memory (Lookup Stage)
+    │  │
+    │  ├─ [X] hash_ram_32Kx64bit [×2]
+    │  │   ├─ Instance 1: 32K × 65-bit SRAM (4-port virtualized)
+    │  │   └─ Instance 2: 32K × 65-bit SRAM (4-port virtualized)
+    │  │       Total: 256 KB dictionary
+    │  │       Format: {valid(1) | prev_data(32) | prev_addr(32)}
+    │  │       Type: Xilinx BRAM (Block RAM)
+    │  │       Latency: 2 cycles (registered output)
+    │  │
+    │  └─ Output: {valid | data | addr} × 4 ports
+    │
+    └─ Match Arbitration (Decision Stage)
+       │
+       ├─ [C] hash_4port_32Kx65bit.v
+       │   │
+       │   ├─ Purpose: Virtualize 4-port access on dual-port BRAM
+       │   ├─ Type: Custom multiplexing logic
+       │   └─ Latency: Combinatorial (0 cycles)
+       │
+       ├─ [C] hash_match.v [×2 instances]
+       │   │
+       │   ├─ Purpose: Evaluate match validity
+       │   ├─ Type: Custom comparison logic
+       │   ├─ Latency: Combinatorial (0 cycles)
+       │   └─ Inputs: Hash results, data patterns, distance
+       │
+       └─ [C] shifter_match.v
+           │
+           ├─ Purpose: Byte-level shift match fallback
+           ├─ Type: Custom matching logic
+           ├─ Latency: Combinatorial (0 cycles)
+           └─ Handles: Partial matches when exact match not found
+
+
+INSIDE lz4_encoder_v3.v [C]:
+================================================================================
+
+lz4_encoder_v3  [C]
+    │
+    ├─ Main FSM State Machine
+    │  ├─ States: IDLE → ENCODE_MAGIC → ENCODE_INFO → ... → ALL_DONE
+    │  ├─ Type: Custom sequential logic
+    │  └─ Latency: 1 cycle per state (variable path length)
+    │
+    ├─ Output Serialization
+    │  ├─ Token generation
+    │  ├─ Literal section encoding
+    │  ├─ Match offset/length encoding
+    │  ├─ Checksum append
+    │  └─ Type: Custom combinatorial + sequential
+    │
+    └─ Internal Output FIFO
+       ├─ Capacity: ~13 KB (BRAM-based, implementation detail)
+       ├─ Format: {validity_mask[1:0], data[31:0]}
+       └─ Type: Custom FIFO logic
+
+
+INSIDE xxh32_calc_v2.v [C]:
+================================================================================
+
+xxh32_calc_v2  [C]
+    │
+    ├─ XXHash32 Algorithm Implementation
+    │  ├─ State machine for hash computation
+    │  ├─ Multiple rounds of mix operations
+    │  └─ Type: Custom sequential logic
+    │
+    └─ [X] xxh32_mul
+        │
+        ├─ 32×32 Multiplier for hash state updates
+        ├─ Type: Xilinx DSP48E multiplier
+        └─ Latency: 3-5 cycles (pipelined)
+
+
+INSIDE byte_addressing_v4.v [C]:
+================================================================================
+
+byte_addressing_v4  [C]
+    │
+    ├─ 96-bit Shift Register
+    │  ├─ Stores 3 × 32-bit dwords
+    │  ├─ Type: Custom register bank
+    │  └─ Latency: 0 cycles (combinatorial output)
+    │
+    └─ Barrel Shifter
+       │
+       ├─ Combinatorial shifter network
+       ├─ Produces 4 parallel byte-aligned outputs
+       ├─ Type: Custom combinatorial logic
+       └─ Latency: 0 cycles
+
+
+INSIDE abs_addr_gen_v3.v [C]:
+================================================================================
+
+abs_addr_gen_v3  [C]
+    │
+    └─ Address Adders
+       │
+       ├─ Adder 1: head_addr + 0
+       ├─ Adder 2: head_addr + 1
+       ├─ Adder 3: head_addr + 2
+       └─ Adder 4: head_addr + 3
+           Type: Custom combinatorial logic
+           Latency: 0 cycles
+
+
+================================================================================
+                    SUMMARY TABLE - ALL MODULES
+================================================================================
+
+Module Name              │ Type │ Lines │ Complexity │ Purpose
+─────────────────────────┼──────┼───────┼────────────┼──────────────────────
+lz4_top_v3              │ [C]  │ 372   │ Medium     │ Top-level wrapper
+control_fsm_v3          │ [C]  │ 1714  │ ★★★ High   │ Main FSM orchestrator
+hash_table_v3           │ [C]  │ 707   │ ★★★ High   │ 4-parallel hash engine
+lz4_encoder_v3          │ [C]  │ 972   │ ★★ Medium  │ LZ4 block format encode
+lz4_buffer_v2           │ [C]  │ 721   │ ★★ Medium  │ 64KB sliding window
+byte_addressing_v4      │ [C]  │ 554   │ Low        │ Barrel shifter
+xxh32_calc_v2           │ [C]  │ 1254  │ ★★ Medium  │ Checksum calculator
+abs_addr_gen_v3         │ [C]  │ 56    │ Low        │ Address generator
+─────────────────────────┼──────┼───────┼────────────┼──────────────────────
+hash_mul32x32           │ [X]  │ IP    │ N/A        │ 32×32 multiplier (×4)
+hash_ram_32Kx64bit      │ [X]  │ IP    │ N/A        │ Hash dictionary (×2)
+buffer_ram32Kx32bit     │ [X]  │ IP    │ N/A        │ Buffer SRAM (×2)
+xxh32_mul               │ [X]  │ IP    │ N/A        │ 32×32 multiplier
+fifo_512x47bit          │ [X]  │ IP    │ N/A        │ Conflict FIFO
+hash_pll                │ [X]  │ IP    │ N/A        │ Clock x2 (250→500MHz)
+─────────────────────────┼──────┼───────┼────────────┼──────────────────────
+hash_4port_32Kx65bit    │ [C]  │ 178   │ Low        │ SRAM access mux
+hash_match              │ [C]  │ 94    │ Low        │ Match evaluation (×2)
+shifter_match           │ [C]  │ 125   │ Low        │ Byte-shift matcher
+─────────────────────────┴──────┴───────┴────────────┴──────────────────────
+
+CUSTOM MODULES TO USE/MODIFY:  8 main + 3 sub = 11 total
+XILINX IP CORES (Fixed):        6 core types (19 instances)
+
+
+================================================================================
+                    CUSTOM MODULE DEPENDENCY GRAPH
+================================================================================
+
+Only showing [C] custom modules:
+
+                    lz4_top_v3 [C]
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+    hash_table [C]   lz4_encoder [C]  lz4_buffer [C]
+        │                │                │
+        ├─hash_4port [C] │                │
+        ├─hash_match [C] │                │
+        └─shifter_match[C]                │
+        
+    + control_fsm [C] (master orchestrator)
+    + byte_addressing [C] (no dependencies)
+    + abs_addr_gen [C] (no dependencies)
+    + xxh32_calc [C] (independent path)
+
+
+================================================================================
+                    DATA FLOW WITH IP CORE USAGE
+================================================================================
+
+INPUT DATA (32-bit)
+        │
+        ▼
+    ┌─[C] lz4_buffer_v2
+    │   ├─[X] buffer_ram32Kx32bit [write port]
+    │   └─[X] fifo_512x47bit [hazard resolution]
+    │
+    ▼ (fifo output)
+    
+    ┌─[C] byte_addressing_v4
+    │   └─ (Pure combinatorial, no IP cores)
+    │
+    ▼ (4 parallel outputs)
+    
+    ┌─[C] hash_table_v3
+    │   ├─[X] hash_mul32x32 [×4] (500MHz domain)
+    │   ├─[X] hash_ram_32Kx64bit [×2] (SRAM lookup)
+    │   ├─[C] hash_4port_32Kx65bit [mux logic]
+    │   ├─[C] hash_match [×2] [evaluation]
+    │   └─[C] shifter_match [fallback]
+    │
+    ▼ (match decision)
+    
+    ┌─[C] control_fsm_v3
+    │   └─ (Pure sequential FSM, no IP cores)
+    │
+    ├──────────────────┬─────────────────┐
+    │                  │                 │
+    │            ┌─[C] lz4_encoder_v3    │
+    │            │   └─ (FSM+logic,      │
+    │            │     no IP cores)      │
+    │            │                       │
+    ▼            ▼                       ▼
+    
+    lz4_buffer    OUTPUT (34-bit)    xxh32_calc
+    [dict read]   compressed data    [parallel]
+                                     Contains [X]
+                                     xxh32_mul
+
+
+================================================================================
+                    HOW TO ADAPT TO ASIC/CUSTOM FPGA
+================================================================================
+
+XILINX IP CORES THAT MUST BE REPLACED:
+
+1. [X] buffer_ram32Kx32bit (×2) → Replace with:
+   ├─ Option A: SRAM compiler from foundry
+   ├─ Option B: Inferred SRAM (synth tool specific)
+   └─ Size: 32K × 32-bit × 2 = 64KB total
+       Ports: Port A (write), Port B (read)
+       Latency: Keep registered output (add pipeline stage if needed)
+
+2. [X] hash_ram_32Kx64bit (×2) → Replace with:
+   ├─ Option A: SRAM compiler from foundry
+   ├─ Option B: Inferred SRAM or multiple smaller blocks
+   └─ Size: 32K × 65-bit × 2 = 520 Kbits
+       Ports: 4-port (virtualized - use hash_4port mux)
+       Latency: Keep 2-cycle registered output
+
+3. [X] fifo_512x47bit → Replace with:
+   ├─ Option A: SRAM compiler + FIFO logic
+   ├─ Option B: Custom FIFO with generate statements
+   └─ Size: 512 × 47-bit = 24 Kb
+       Ports: Single write, single read
+       Latency: Keep as-is
+
+4. [X] hash_mul32x32 (×4) → Replace with:
+   ├─ Option A: Multiplier from foundry stdlib
+   ├─ Option B: Behavioral RTL multiply (synth-optimized)
+   └─ Operation: a × b where a=0x9E3779B1 (constant)
+       Can optimize to multiplier + shift
+
+5. [X] xxh32_mul → Replace with:
+   ├─ Option A: Multiplier from foundry stdlib
+   ├─ Option B: Behavioral RTL multiply (synth-optimized)
+   └─ Similar to hash_mul32x32
+
+6. [X] hash_pll → Replace with:
+   ├─ Option A: Foundry PLL (2× multiplier)
+   ├─ Option B: External 500MHz clock
+   ├─ Option C: DCO (digitally controlled oscillator)
+   └─ Generates: 250MHz (input) → 500MHz (output)
+
+
+ALL CUSTOM [C] MODULES CAN STAY AS-IS:
+
+✓ lz4_top_v3.v ..................... No changes needed
+✓ control_fsm_v3.v ................. No changes needed (pure RTL FSM)
+✓ hash_table_v3.v .................. Replace IP cores, keep logic
+✓ lz4_encoder_v3.v ................. No changes needed
+✓ lz4_buffer_v2.v .................. Replace IP cores, keep logic
+✓ byte_addressing_v4.v ............. No changes needed
+✓ xxh32_calc_v2.v .................. Replace IP core multiplier, keep logic
+✓ abs_addr_gen_v3.v ................ No changes needed
+✓ hash_4port_32Kx65bit.v ........... No changes needed (still used for muxing)
+✓ hash_match.v [×2] ................ No changes needed
+✓ shifter_match.v .................. No changes needed
+
+
+EFFORT ESTIMATE FOR ASIC PORT:
+
+Task                          │ Effort │ Duration
+──────────────────────────────┼────────┼──────────
+IP core replacement (6 types) │ High   │ 2-3 weeks
+SRAM compiler integration     │ Medium │ 1-2 weeks
+PLL/clock synthesis           │ Medium │ 1 week
+Behavioral mult. synthesis    │ Low    │ 3-5 days
+Simulation & verification     │ High   │ 3-4 weeks
+Place & Route                 │ Medium │ 2 weeks
+─────────────────────────────────────────────────
+TOTAL ESTIMATED              │        │ 6-8 weeks
+
+
+================================================================================
+                    QUICK REFERENCE: IP CORE REPLACEMENT
+================================================================================
+
+File                          │ Xilinx IP        │ ASIC Replacement
+──────────────────────────────┼──────────────────┼──────────────────────────
+lz4_buffer_v2.v              │ buffer_ram32K... │ sram_32k_32b_sp / compiler
+                             │ fifo_512x47bit   │ sram_512x47 + FIFO logic
+hash_table_v3.v              │ hash_mul32x32    │ mult_32x32 / behavioral
+                             │ hash_ram_32Kx64  │ sram_32k_65b_mp / compiler
+xxh32_calc_v2.v              │ xxh32_mul        │ mult_32x32 / behavioral
+lz4_top_v3.v                 │ hash_pll         │ pll_2x / external_clk
+
+
+REPLACEMENT CHECKLIST:
+
+For each Xilinx IP instance:
+
+□ Identify all port connections in current design
+  └─ Use LZ4_INSTANTIATION_MAP.txt as reference
+
+□ Find ASIC equivalent (SRAM compiler, stdlib, or behavioral)
+  └─ Consult foundry/tool documentation
+
+□ Create wrapper module with same port interface
+  └─ Ensure port names match exactly
+
+□ Verify timing (add registered outputs if needed)
+  └─ Maintain 2-cycle latency for SRAM
+
+□ Test in simulation with behavioral model
+  └─ Verify functional equivalence
+
+□ Synthesize and check resource utilization
+  └─ Compare area, power, timing estimates
+
+□ Run through place & route
+  └─ Verify timing closure, optimize if needed
+
+
+================================================================================
+                    COMMONLY USED ASIC REPLACEMENTS
+================================================================================
+
+SRAM Replacement Examples:
+
+Xilinx BRAM:           32K × 32-bit (buffer_ram32Kx32bit)
+ASIC Option 1:         SRAM Compiler: 32kx32_2rw1w_hs
+ASIC Option 2:         Multiple smaller blocks: 4 × 8kx32_1r1w
+ASIC Option 3:         Behavioral: reg [31:0] mem [0:32767];
+
+Xilinx BRAM:           32K × 65-bit (hash_ram_32Kx64bit)
+ASIC Option 1:         SRAM Compiler: 32kx65_1r1w × 2 blocks
+ASIC Option 2:         Inferred: reg [64:0] hash_mem [0:32767];
+
+
+Multiplier Replacement Examples:
+
+Xilinx DSP:            32 × 32 → 64 (hash_mul32x32)
+ASIC Option 1:         Multiplier from std_cells: mult_32x32
+ASIC Option 2:         Behavioral: assign product = a * b;
+ASIC Option 3:         Optimized: Since a=0x9E3779B1 (constant),
+                       use shift+add decomposition
+
+
+PLL Replacement Examples:
+
+Xilinx PLL:            250MHz → 500MHz (hash_pll)
+ASIC Option 1:         Foundry PLL: pll_500m_from_250m
+ASIC Option 2:         External clock: Provide 500MHz from outside
+ASIC Option 3:         DCO: Digitally controlled oscillator in analog
+
+
+================================================================================
+                    KEY POINTS FOR ADAPTATION
+================================================================================
+
+1. PORT NAMES MUST MATCH:
+   When replacing Xilinx IP, keep the exact same port names.
+   This allows drop-in replacement without code changes.
+
+2. LATENCY PRESERVATION:
+   SRAM outputs have 2-cycle latency in Xilinx BRAM.
+   Maintain this in ASIC replacement (add register stage if needed).
+
+3. CLOCK DOMAINS:
+   clk_1x (250 MHz): Main logic (control_fsm, encoder, buffer)
+   clk_2x (500 MHz): Hash multipliers only
+   Keep this separation - don't merge clock domains.
+
+4. ACTIVE-LOW RESET:
+   All Xilinx IP uses rstN (active-low reset).
+   Ensure ASIC equivalents also support active-low reset.
+
+5. SIMULATION FIRST:
+   Always verify ASIC equivalent in simulation before synthesis.
+   Compare outputs with Xilinx IP reference.
+
+6. PARAMETERIZATION:
+   Some SRAM sizes can be parameterized (e.g., address width).
+   Fix parameters to match: 32K = 15-bit address, 64KB = 16-bit address.
+
+
+================================================================================
+                    FILE MAPPING FOR REPLACEMENT
+================================================================================
+
+Current Structure:
+─────────────────
+
+/mix_compress_v1/RTL_lz4/
+├─ lz4_top_v3.v ..................... [C] Keep as-is
+├─ control_fsm_v3.v ................. [C] Keep as-is
+├─ hash_table_v3.v .................. [C] Keep, replace IP calls
+├─ lz4_encoder_v3.v ................. [C] Keep as-is
+├─ lz4_buffer_v2.v .................. [C] Keep, replace IP calls
+├─ byte_addressing_v4.v ............. [C] Keep as-is
+├─ xxh32_calc_v2.v .................. [C] Keep, replace IP calls
+├─ abs_addr_gen_v3.v ................ [C] Keep as-is
+├─ hash_4port_32Kx65bit.v ........... [C] Keep as-is
+├─ hash_match.v ..................... [C] Keep as-is
+├─ shifter_match.v .................. [C] Keep as-is
+│
+└─ ipcores/ (Xilinx IP blocks)
+   ├─ hash_mul32x32.v ............... [X] → Replace
+   ├─ hash_ram_32Kx64bit.v .......... [X] → Replace
+   ├─ buffer_ram32Kx32bit.v ......... [X] → Replace
+   ├─ xxh32_mul.v ................... [X] → Replace
+   ├─ fifo_512x47bit.v .............. [X] → Replace
+   └─ hash_pll.v .................... [X] → Replace
+
+
+Recommended ASIC Structure:
+──────────────────────────
+
+/asic_port/RTL/
+├─ (Copy all [C] modules as-is)
+│
+├─ memory/
+│   ├─ sram_32k32b_dual_port.v ....... ASIC SRAM wrapper
+│   ├─ sram_32k65b_dual_port.v ....... ASIC SRAM wrapper
+│   └─ fifo_512x47.v ................ Custom FIFO (SRAM-based)
+│
+├─ arithmetic/
+│   ├─ mult_32x32.v .................. ASIC multiplier wrapper
+│   └─ mult_32x32_optimized.v ........ (Optional) optimized version
+│
+├─ clocking/
+│   ├─ pll_2x.v ..................... ASIC PLL wrapper
+│   └─ clk_divider.v ................ (Optional) for external clock
+│
+└─ lz4_top_asic.v ................... Top-level (replace IP instances)
+
+
+================================================================================

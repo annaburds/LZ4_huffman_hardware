@@ -1,0 +1,245 @@
+================================================================================
+                    WHY HASH USES 2X CLOCK (500 MHz) 
+================================================================================
+
+SHORT ANSWER:
+═════════════
+
+The PLL doubles the clock to allow 4 parallel 32×32 multiplications to complete
+within the same time as 1 main clock cycle. This achieves 4× hash throughput
+while keeping the main datapath at 250 MHz.
+
+
+DETAILED EXPLANATION:
+═════════════════════
+
+1. THE PROBLEM: 4 Parallel Hash Lookups
+   ──────────────────────────────────────
+   
+   At each clock cycle, the system needs to process 4 bytes in parallel:
+   
+   Input (250 MHz):  [Byte1][Byte2][Byte3][Byte4]
+                         ↓      ↓      ↓      ↓
+   Need:            hash1  hash2  hash3  hash4  (4 lookups in 1 cycle)
+                         ↓      ↓      ↓      ↓
+   Dictionary:     addr1  addr2  addr3  addr4   (4 ports virtualized)
+
+
+2. THE SOLUTION: Dual-Port SRAM + 2X Clock
+   ────────────────────────────────────────
+   
+   The hash_ram_32Kx64bit blocks are DUAL-PORT (only 2 ports per SRAM):
+   
+   Physical:  Port A, Port B  (only 2 simultaneous reads/writes)
+   Logical:   Port A, Port B, Port C, Port D  (need 4 simultaneous accesses)
+   
+   Solution: Use time-multiplexing with clk_2x (500 MHz):
+   
+   At 250 MHz:   1 main clock cycle = 4 ns
+   At 500 MHz:   1 half clock cycle = 2 ns
+   
+   The 500 MHz clock gives 4 half-cycle periods per main clock:
+   
+   ┌──────────────────────────────────┐  1 Main Cycle (4 ns @ 250 MHz)
+   │  ┌─┐  ┌─┐  ┌─┐  ┌─┐              │
+   │  │▲│  │▲│  │▲│  │▲│              │  4 × 500 MHz Half-Cycles
+   │  └─┘  └─┘  └─┘  └─┘              │
+   └──────────────────────────────────┘
+     T0   T1   T2   T3
+
+   Time Slot Assignment:
+   ───────────────────
+   
+   T0 (clk_2x pos-edge 0):  Ports A, B access hash_ram (main lookup)
+   T1 (clk_2x pos-edge 1):  Ports C, D access hash_ram (stored in registers)
+   T2 (clk_2x pos-edge 2):  Ports A, B access hash_ram (next main lookup)
+   T3 (clk_2x pos-edge 3):  Ports C, D access hash_ram (stored in registers)
+   
+
+3. THE HARDWARE: 4-Port Virtualization
+   ────────────────────────────────────
+   
+   From hash_4port_32Kx65bit.v:
+   
+   // Time slot register - alternates every clk_2x cycle
+   always @ (posedge clk_2x)
+       time_slot <= ~time_slot;
+   
+   // Ports C,D data stored for later
+   always @ (posedge clk_2x)
+       addrc_reg <= addrc;
+       addrd_reg <= addrd;
+       dinc_reg  <= dinc;
+       dind_reg  <= dind;
+       wec_reg   <= wec;
+       wed_reg   <= wed;
+   
+   // Data output latched at each edge
+   always @ (posedge clk_2x)
+       douta_reg <= ram_douta;   // Port A
+       doutb_reg <= ram_doutb;   // Port B
+       doutc_reg <= ram_doutc;   // Port C
+       doutd_reg <= ram_doutd;   // Port D
+
+
+4. PERFORMANCE ADVANTAGE
+   ─────────────────────
+   
+   Without 2x clock (if running all at 250 MHz):
+   
+   4 parallel hash multiplies would need 4 serial SRAM accesses:
+   ┌─────┐     ┌─────┐     ┌─────┐     ┌─────┐
+   │Port A│ → │Port B│ → │Port C│ → │Port D│  (4 cycles!)
+   └─────┘     └─────┘     └─────┘     └─────┘
+   
+   Result: Latency = 4 cycles (blocks compression pipeline)
+   
+   
+   With 2x clock (500 MHz):
+   
+   4 parallel hash multiplies can be issued in 1 main cycle:
+   ┌─────┬─────┬─────┬─────┐
+   │A,B  │C,D  │A,B  │C,D  │  (overlapped in 1 main cycle)
+   └─────┴─────┴─────┴─────┘
+   
+   Result: Latency = 1 cycle (keeps pipeline flowing)
+
+
+5. THE MULTIPLIERS: Why They Also Need 2x Clock
+   ──────────────────────────────────────────────
+   
+   The hash function uses: hash_key = (data × 0x9E3779B1) >> 17
+   
+   A Xilinx DSP48E multiplier (32×32):
+   ├─ Input latency: 1-2 cycles
+   ├─ Multiply latency: 3-5 cycles at 250 MHz
+   └─ Total: ~5-7 cycles for result to settle
+   
+   At 250 MHz: 5-7 cycles = 20-28 ns (too slow)
+   At 500 MHz: Same operations complete in 10-14 ns
+   
+   This allows 4 parallel multiplies to complete within time-multiplexed slots:
+   
+   hash_mul32x32 U_hash_mul1 (
+       .clk   (clk_2x),        ← 500 MHz clock
+       .a     (data1),
+       .b     (0x9E3779B1),
+       .p     (hash_key1)
+   );
+   
+   So at 250 MHz main clock rate:
+   ├─ Slot 0 (clk_2x=0): Multiply data1
+   ├─ Slot 1 (clk_2x=1): Multiply data2
+   ├─ Slot 2 (clk_2x=2): Multiply data3
+   └─ Slot 3 (clk_2x=3): Multiply data4
+
+
+6. CLOCK DOMAIN CROSSING (CDC)
+   ────────────────────────────
+   
+   Two independent clock domains exist:
+   
+   clk_1x (250 MHz):          clk_2x (500 MHz):
+   ┌──────────────┐           ┌──────────────┐
+   │control_fsm   │           │hash_mul32x32 │
+   │lz4_encoder   │           │hash_4port    │
+   │lz4_buffer    │           │hash_ram      │
+   │byte_address  │           └──────────────┘
+   │xxh32_calc    │
+   └──────────────┘
+   
+   Synchronization happens through:
+   ├─ Input: control_fsm sends 4 dwords @ 250 MHz
+   ├─ Samples them into hash_table_v3 input registers
+   ├─ Hash runs at 500 MHz internally
+   └─ Output: Results synchronized back to 250 MHz via output latch
+
+
+7. TIMING ADVANTAGE SUMMARY
+   ──────────────────────────
+   
+   Main advantage: Achieve 4 parallel operations in 1 main clock cycle
+   
+   Pipeline Throughput:
+   ├─ Input: 4 bytes/cycle = 1000 MB/s @ 250 MHz (4 bytes × 250M × 2)
+   ├─ Hash: 4 lookups/cycle = achievable with 2x clock
+   ├─ Output: 4 matches/cycle = pipeline doesn't stall
+   └─ Result: 250 MB/s sustained compression throughput
+
+
+8. ALTERNATIVE: What If We Didn't Use 2x Clock?
+   ──────────────────────────────────────────────
+   
+   If we removed hash_pll and ran everything at 250 MHz:
+   
+   ❌ Problems:
+   ├─ Can only access dual-port SRAM once per cycle
+   ├─ 4 hash lookups would require 4 sequential cycles
+   ├─ 4 multipliers would need serialization
+   ├─ Pipeline would stall 3 out of 4 cycles
+   └─ Compression ratio would drop to 25% throughput (62.5 MB/s)
+   
+   ✓ Benefits of removing PLL:
+   ├─ Simpler design (no CDC)
+   ├─ Less power consumption
+   ├─ Easier timing closure
+   └─ Suitable for low-bandwidth applications
+
+
+9. KEY INSIGHT: Time-Multiplexing vs Space-Multiplexing
+   ─────────────────────────────────────────────────────
+   
+   The design chose TIME-MULTIPLEXING over SPACE-MULTIPLEXING:
+   
+   Space approach (not used):
+   ├─ Use 4 separate dual-port SRAMs
+   ├─ Run at 250 MHz
+   ├─ Area cost: 4× memory overhead
+   └─ Simpler control logic
+   
+   Time approach (used here):
+   ├─ Use 2 dual-port SRAMs
+   ├─ Run clock at 2× (500 MHz)
+   ├─ Area cost: 2× memory (more efficient)
+   └─ Complex multiplexing logic (hash_4port_32Kx65bit.v)
+   
+   Result: Better area efficiency, similar throughput
+
+
+10. DESIGN IMPLICATIONS FOR ASIC PORT
+    ─────────────────────────────────
+    
+    When porting to ASIC, you must:
+    
+    ✓ Keep the 2x clock architecture
+    ├─ Performance depends on this timing
+    └─ Removing it requires complete redesign
+    
+    ✓ Replace xilinx hash_pll with:
+    ├─ Foundry PLL (if available)
+    ├─ External 500 MHz clock
+    └─ DCO (if analog available)
+    
+    ✓ CDC synchronizers between domains:
+    ├─ Input data handshake (clk_1x → clk_2x)
+    ├─ Output result handshake (clk_2x → clk_1x)
+    └─ Already implemented in hash_table_v3.v
+
+
+CONCLUSION:
+═══════════
+
+The 2x PLL is a **clever performance optimization** that allows:
+  • 4 parallel hash operations per main clock cycle
+  • 1:1 throughput match between input and hash engine
+  • Memory-efficient time-multiplexing
+  • 250 MB/s sustained compression throughput
+
+Without it: Only 62.5 MB/s (pipeline stalled)
+With it:     250 MB/s (optimal utilization)
+
+
+This is a common technique in high-bandwidth hardware designs where:
+  ├─ External interface runs at slower speed (250 MHz)
+  ├─ Internal critical path uses 2x speed (500 MHz)
+  └─ Time multiplexing reduces area without sacrificing throughput

@@ -1,0 +1,365 @@
+================================================================================
+                    LZ4 HARDWARE - SIGNAL BUS WIDTHS & TIMING
+================================================================================
+
+INPUT/OUTPUT INTERFACE (Top-level lz4_top_v3):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  INPUT STREAMS:                                                             │
+│  ├─ clk                  [1-bit]   Clock input (250 MHz)                   │
+│  ├─ rstN                 [1-bit]   Active-low reset                        │
+│  ├─ idata                [32-bit]  Input data (32-bit words)               │
+│  ├─ idata_req            [1-bit]   Input data valid                        │
+│  ├─ data_terminal        [1-bit]   Last data indicator                     │
+│  ├─ start_compress       [1-bit]   Compression enable                      │
+│  ├─ file_length          [32-bit]  Total bytes to compress                 │
+│  ├─ file_length_valid    [1-bit]   File length valid                       │
+│  └─ out_en               [1-bit]   Output read enable                      │
+│                                                                             │
+│  OUTPUT STREAMS:                                                            │
+│  ├─ out_data             [34-bit]  Compressed data + valid mask            │
+│  │                                 [33:32] = validity mask (2 bits)        │
+│  │                                 [31:0] = 32-bit data chunk              │
+│  ├─ out_valid            [1-bit]   Output has valid data                   │
+│  ├─ out_empty            [1-bit]   Output FIFO empty                       │
+│  ├─ obuf_full            [1-bit]   Output buffer full                      │
+│  ├─ ohalf_full           [1-bit]   Output buffer half-full                 │
+│  ├─ compressed_len       [32-bit]  Output bytes generated                  │
+│  ├─ mfifo_full           [1-bit]   Match FIFO full                         │
+│  ├─ mfifo_empty          [1-bit]   Match FIFO empty                        │
+│  ├─ compress_done        [1-bit]   Compression complete                    │
+│  ├─ mfifo_valid          [1-bit]   Match FIFO has data (debug)             │
+│  └─ mfifo_data           [31:0]    Match FIFO data (debug)                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+INTERNAL SIGNAL WIDTHS & TIMING:
+================================================================================
+
+STAGE 1: INPUT BUFFERING (lz4_buffer_v2)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  Input FIFO:     buffer_ram32Kx32bit [×2]     (64KB circular buffer)      │
+│  Capacity:       32K × 32-bit = 128Kb (16 KB per port)                    │
+│                                                                            │
+│  Output Signals:                                                           │
+│  ├─ fifo_odata       [32-bit]  One 32-bit word from buffer                │
+│  ├─ fifo_ovalid      [1-bit]   Data valid                                 │
+│  ├─ fifo_count       [15-bit]  Words available (0-32768)                  │
+│  ├─ buf_full         [1-bit]   No room for more input                      │
+│  ├─ fifo_empty       [1-bit]   No data available                           │
+│  ├─ head_addr        [32-bit]  Current write pointer (absolute)           │
+│  └─ anchor           [32-bit]  Match anchor point                          │
+│                                                                            │
+│  Conflict Handling FIFO: fifo_512x47bit                                    │
+│  ├─ Entries:         512 × 47-bit                                          │
+│  ├─ Usage:           Stores {addr[14:0], data[31:0]} conflicts             │
+│  └─ Capacity:        ~18KB (very small, for RAW/WAW resolution)            │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+LATENCY THROUGH STAGE 1: 1-2 cycles
+
+
+STAGE 2: BYTE-LEVEL SHIFTING (byte_addressing_v4)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  Internal Shifter:    96-bit shift register (3 × 32-bit dwords)            │
+│                                                                            │
+│  Control Inputs (from control_fsm):                                        │
+│  ├─ byte4_en          [1-bit]   Enable shift operation                     │
+│  ├─ rd_data_en        [1-bit]   Read request from FIFO                     │
+│  ├─ shift_dist        [3-bit]   Shift amount (0-7 bytes)                   │
+│  └─ shift_en          [1-bit]   Enable shift for next cycle                │
+│                                                                            │
+│  Output Signals (Barrel Shifter Outputs):                                  │
+│  ├─ byte4_data1       [32-bit]  Data[95:64]  (bytes 7-4)                   │
+│  ├─ byte4_data2       [32-bit]  Data[87:56]  (bytes 6-3) ← Main stream    │
+│  ├─ byte4_data3       [32-bit]  Data[79:48]  (bytes 5-2)                   │
+│  ├─ byte4_data4       [32-bit]  Data[71:40]  (bytes 4-1)                   │
+│  └─ byte4_valid       [1-bit]   Outputs valid                              │
+│                                                                            │
+│  These 4 streams feed the 4 hash engines in parallel!                      │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+LATENCY THROUGH STAGE 2: 0 cycles (combinatorial) → outputs valid same cycle
+
+
+STAGE 3: ADDRESS GENERATION (abs_addr_gen_v3)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  Input:                                                                    │
+│  ├─ head_addr         [32-bit]  Current position                           │
+│  └─ incr_bytes        [3-bit]   Byte increment per cycle (0-7)             │
+│                                                                            │
+│  Outputs (Pure Combinatorial Adders):                                      │
+│  ├─ abs_addr          [32-bit]  Current address                            │
+│  ├─ abs_addr1         [32-bit]  head_addr + 0                              │
+│  ├─ abs_addr2         [32-bit]  head_addr + 1                              │
+│  ├─ abs_addr3         [32-bit]  head_addr + 2                              │
+│  └─ abs_addr4         [32-bit]  head_addr + 3                              │
+│                                                                            │
+│  Used to tag hash inputs with their position in stream                     │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+LATENCY THROUGH STAGE 3: 0 cycles (combinatorial)
+
+
+STAGE 4: HASH CALCULATION (hash_table_v3 - CRITICAL STAGE)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  Hash Function: hash_key = (data × 0x9E3779B1)[31:17]                    │
+│                                                                            │
+│  Sub-Stage 4a: HASH MULTIPLIERS                                            │
+│  ├─ Inputs (×4 parallel):                                                  │
+│  │  ├─ hash_idata[1-4]  [32-bit] Data to hash                              │
+│  │  ├─ hash_iaddr[1-4]  [32-bit] Address of data                           │
+│  │  └─ hash_ivalid[1-4] [1-bit]  Valid indicator                           │
+│  │                                                                         │
+│  ├─ IP Core: hash_mul32x32 [×4] (Xilinx 32×32 DSP Multiplier)              │
+│  │  ├─ Clock:          clk_2x (500 MHz, 2ns cycle)                        │
+│  │  ├─ Latency:        3-5 cycles (pipelined in DSP48E)                   │
+│  │  ├─ Throughput:     1 per cycle                                         │
+│  │  └─ Output:         p[63:0] = a × b                                    │
+│  │                                                                         │
+│  └─ Outputs after 3-5 cycles:                                              │
+│     └─ hash_key[1-4]   [15-bit] {hash_temp[31:17]}                        │
+│                                                                            │
+│  Sub-Stage 4b: HASH TABLE MEMORY LOOKUP                                    │
+│  ├─ Memory: hash_ram_32Kx64bit [×2] (Xilinx Dual-Port BRAM)                │
+│  │  ├─ Size:          32K entries × 65 bits = 256Kb total                 │
+│  │  ├─ Organization:  Spread across 2 BRAM blocks                          │
+│  │  ├─ Ports:         Port A, Port B, Port C, Port D                      │
+│  │  │                (4-port virtualized via mux)                          │
+│  │  ├─ Read Latency:   2 cycles (BRAM registered output)                  │
+│  │  ├─ Write Latency:  1 cycle (immediate)                                │
+│  │  └─ Addressing:    [14:0] (15-bit addresses = 32K entries)              │
+│  │                                                                         │
+│  │  Memory Format:     {valid_flag(1) | prev_data(32) | prev_addr(32)}    │
+│  │                     Stores most recent matching data for each hash key   │
+│  │                                                                         │
+│  ├─ Control Signals (from control_fsm):                                    │
+│  │  ├─ hash_wr_only    [1-bit]  Write-only mode (single byte shift)        │
+│  │  ├─ hash_clean      [1-bit]  Clear hash table                           │
+│  │  └─ hash_unable     [1-bit]  Busy signal to FSM                         │
+│  │                                                                         │
+│  └─ Outputs:                                                               │
+│     ├─ hash_hit        [1-bit]  Match found!                               │
+│     ├─ hash_oaddr      [32-bit] Matched data address                       │
+│     ├─ hit_dist        [32-bit] Distance (current - previous)              │
+│     ├─ hit_status      [3-bit]  Match quality (0=exact, 1-3=approx)        │
+│     └─ hash_ovalid     [1-bit]  Output valid                               │
+│                                                                            │
+│  Sub-Stage 4c: MATCH ARBITRATION                                           │
+│  ├─ hash_4port_32Kx65bit.v (Custom - SRAM access logic)                    │
+│  │  └─ Arbitrates 4 simultaneous {read, write} requests                    │
+│  │                                                                         │
+│  ├─ hash_match [×2] (Custom - Match evaluation per port)                   │
+│  │  ├─ Input: Data patterns, addresses, distance                           │
+│  │  ├─ Output: Match found? distance valid?                               │
+│  │  └─ Logic: Compare full data, not just hash                             │
+│  │                                                                         │
+│  └─ shifter_match.v (Custom - Byte-shift match fallback)                   │
+│     ├─ Handles partial byte matching when exact match not found            │
+│     └─ Provides backup match candidates                                    │
+│                                                                            │
+│  TOTAL LATENCY: 5-7 cycles (hash mult 3-5 + SRAM read 2)                  │
+│  THROUGHPUT: 4 matches/cycle (after pipeline fill)                         │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+
+STAGE 5: CONTROL FSM (control_fsm_v3)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  State Machine Logic (1714 lines of RTL):                                  │
+│  ├─ Receives:  Match results from hash_table                              │
+│  │             Dictionary lookups from lz4_buffer                          │
+│  │             Status from byte_addressing, encoder                        │
+│  │                                                                         │
+│  ├─ Decides:   Keep this literal or take match?                           │
+│  │             Which match if multiple candidates?                         │
+│  │             When to update hash table?                                  │
+│  │             When to fetch from dictionary?                              │
+│  │                                                                         │
+│  └─ Outputs:   Match/literal decision                                      │
+│               Match offset + length                                        │
+│               Unmatch length + data                                        │
+│               Control signals (shift, hash_clean, etc.)                    │
+│                                                                            │
+│  Clock Domain: clk_1x (250 MHz, 4ns cycle)                                 │
+│  Latency: 1 cycle (synchronous FSM)                                        │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+
+STAGE 6: COMPRESSION ENCODING (lz4_encoder_v3)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  Inputs:                                                                   │
+│  ├─ match_offset      [16-bit]  Little-endian offset to match             │
+│  ├─ match_length      [32-bit]  Match length (≥4)                          │
+│  ├─ unmatch_length    [32-bit]  Literal count (0-15+)                      │
+│  ├─ unmatch_data      [32-bit]  Literal bytes to encode                    │
+│  ├─ info_valid        [1-bit]   Token valid                                │
+│  ├─ blocksize_id      [8-bit]   LZ4 block ID byte                          │
+│  ├─ header_crc        [8-bit]   Frame header CRC                           │
+│  └─ xxh32_dword       [32-bit]  Checksum from xxh32_calc                   │
+│                                                                            │
+│  Output Signals:                                                           │
+│  ├─ out_data          [34-bit]  {valid_mask[1:0], data[31:0]}              │
+│  │                              Valid mask: which of 4 bytes are valid     │
+│  ├─ out_valid         [1-bit]   Output has data                            │
+│  ├─ out_empty         [1-bit]   Output FIFO empty                          │
+│  ├─ obuf_full         [1-bit]   Output buffer full                         │
+│  ├─ ohalf_full        [1-bit]   Output at 50% capacity                     │
+│  ├─ encode_done       [1-bit]   All blocks encoded                         │
+│  ├─ encode_busy       [1-bit]   Cannot accept new tokens                   │
+│  ├─ seg_done          [1-bit]   Current segment complete                   │
+│  ├─ fifo_count        [13-bit]  Words in output FIFO                       │
+│  └─ compressed_len    [32-bit]  Total bytes generated                      │
+│                                                                            │
+│  Block Format (Generated):                                                 │
+│  ├─ Magic Number:     0x184D2204 (4 bytes, big-endian)                     │
+│  ├─ Frame Descriptor: {FlgBd | Max_Blk | Checksums}                        │
+│  ├─ Data Block Hdr:   {Bl_flag | Blk_crc | Blk_size[2:0]}                  │
+│  ├─ Token Stream:     {Lit_len[3:0] | Match_len[3:0]}                      │
+│  ├─ Literal Section:  Variable-length encoded + raw bytes                  │
+│  ├─ Match Section:    {Offset[15:0] LE | Match_len Variable}               │
+│  ├─ Block Checksum:   CRC32 (optional)                                     │
+│  └─ Frame Checksum:   XXHash32 (4 bytes)                                   │
+│                                                                            │
+│  Output FIFO:         Internal BRAM-based FIFO                             │
+│  Capacity:            ~13 Kb (varies by encoder version)                   │
+│                                                                            │
+│  Latency: Depends on match length (variable):                              │
+│  ├─ Short match/literal: 2-4 cycles                                        │
+│  ├─ Long match (>255B): 10-15 cycles (variable-length encoding)            │
+│  └─ Average: ~3-5 cycles per match                                         │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+
+STAGE 7: XXHASH32 CHECKSUM (xxh32_calc_v2)
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  Parallel to Stages 1-6 (separate data path)                               │
+│                                                                            │
+│  Input Stream:                                                             │
+│  ├─ data              [32-bit]  Raw input data                             │
+│  ├─ data_valid        [1-bit]   Input valid                                │
+│  ├─ compress_start    [1-bit]   Start hash computation                     │
+│  ├─ compress_done     [1-bit]   End stream                                 │
+│  ├─ length            [32-bit]  Total stream length                        │
+│  └─ length_valid      [1-bit]   Length valid                               │
+│                                                                            │
+│  Core:  xxh32_mul (Xilinx 32×32 DSP Multiplier)                            │
+│  └─ Multiple rounds of multiply + XOR + rotate                             │
+│                                                                            │
+│  Output:                                                                   │
+│  ├─ digest            [32-bit]  Final hash (XXHash32 output)                │
+│  └─ digest_valid      [1-bit]   Hash complete                              │
+│                                                                            │
+│  Latency: ~1254 lines, complex state machine                               │
+│  Implementation: Full XXHash32 algorithm                                    │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+
+PIPELINE SUMMARY:
+================================================================================
+
+                    CYCLE-BY-CYCLE PROGRESSION
+                    
+Cycle 0:  Input data arrives → buf in → shift register
+Cycle 1:  Shifter outputs 4 parallel streams
+Cycle 2:  Hash multiply starts (3-5 cycle latency)
+Cycle 3:  Address generation (combinatorial, available)
+Cycle 4:  
+Cycle 5:  Hash multiply results ready
+Cycle 6:  SRAM read starts (2 cycle latency)
+Cycle 7:  
+Cycle 8:  Match data available from SRAM
+Cycle 9:  FSM makes decision
+Cycle 10: Encoder starts encoding
+Cycle 11-13: Variable length token output
+Cycle 14: Next cycle ready
+
+SUSTAINED THROUGHPUT: 1 token decision per cycle (after pipeline fill)
+                     Output rate: ~0.5-1 compressed words/cycle
+
+
+CLOCK DOMAINS:
+================================================================================
+
+Domain 1: clk_1x (250 MHz, 4ns)
+  Modules:  control_fsm_v3, lz4_encoder_v3, lz4_buffer_v2, 
+            byte_addressing_v4, abs_addr_gen_v3, xxh32_calc_v2
+  Registers: FSM state, counters, data latches
+
+Domain 2: clk_2x (500 MHz, 2ns) - from hash_pll
+  Modules:  hash_table_v3 (hash multipliers)
+  Purpose:  4× parallel hash calculations in one clk_1x cycle
+  
+Synchronization: CDC (Clock Domain Crossing) between clk_1x and clk_2x
+  - All results synchronized back to clk_1x domain
+  - METASTABILITY: Registers on CDC paths not shown in detail
+
+
+MEMORY HIERARCHY:
+================================================================================
+
+Level 1 - Shift Registers (Combinatorial):
+  └─ byte_addressing_v4: 96-bit register (3× 32-bit dwords)
+
+Level 2 - Dual-Port SRAM (Fast):
+  ├─ buffer_ram32Kx32bit [×2]: 32KB × 32-bit (64KB total)
+  │  └─ Latency: 1-2 cycles (registered read)
+  └─ hash_ram_32Kx64bit [×2]: 32KB × 64-bit
+     └─ Latency: 2 cycles (registered read)
+
+Level 3 - FIFO Buffers:
+  ├─ fifo_512x47bit: 512×47 = 24Kb (Conflict resolution)
+  └─ lz4_encoder internal FIFO: ~13Kb (Output serialization)
+
+TOTAL ON-CHIP MEMORY:
+  ├─ Data memory: 64 KB (buffer)
+  ├─ Hash table:  256 KB (4 × 65 bits × 32K entries / 8)
+  ├─ FIFOs:       ~50 KB
+  ├─ Register files & shift registers: ~10 KB
+  └─ TOTAL: ~380 KB SRAM equivalent
+
+
+DESIGN EFFICIENCY METRICS:
+================================================================================
+
+Code Metrics:
+  ├─ Total RTL: ~6800 lines of Verilog (without IP core internals)
+  ├─ Custom Logic: ~4200 lines
+  ├─ Xilinx IP: 19 instances
+  └─ Ratio: 18:1 custom:IP
+
+Performance:
+  ├─ Compression throughput: ~250 MB/s @ 250 MHz (best case)
+  │  └─ Assuming 1 byte decision per cycle (conservative)
+  ├─ Match detection latency: 5-7 cycles
+  ├─ Overall pipeline latency: ~15 cycles
+  └─ System frequency: 250 MHz (dual-clock with 500 MHz for hashing)
+
+Resource Utilization (on typical Xilinx FPGA):
+  ├─ BRAM: ~28-30 blocks (36Kb each)
+  ├─ DSP48E: 5 (4 hash muls + 1 xxhash mul)
+  ├─ LUTs: ~8-10K
+  ├─ Registers: ~4-5K
+  └─ IO: ~70 pins @ top level
+
+Power Estimate (Typical Xilinx -3 @ 1.0V):
+  ├─ SRAM leakage: ~100mW (always on)
+  ├─ SRAM dynamic: ~50-100 mW
+  ├─ Logic dynamic: ~200-300 mW
+  └─ Total: ~350-500 mW (data-dependent)
+
+================================================================================
