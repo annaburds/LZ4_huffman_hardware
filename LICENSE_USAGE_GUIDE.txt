@@ -1,0 +1,367 @@
+================================================================================
+                        LICENSE ANALYSIS & USAGE RIGHTS
+================================================================================
+
+LICENSE TYPE: GNU AFFERO GENERAL PUBLIC LICENSE v3 (AGPLv3)
+Repository: LZ4_huffman_hardware
+Owner: weslay-koo
+
+================================================================================
+                            WHAT YOU CAN DO
+================================================================================
+
+✓ ALLOWED:
+──────────
+
+1. Use the hardware design in your project (any purpose)
+   └─ Commercial, research, personal projects all OK
+
+2. Modify and improve the design
+   └─ Change any Verilog code as needed
+   └─ Optimize for your platform
+
+3. Copy and distribute the source code
+   └─ Give to friends, colleagues, publish online
+
+4. Create derivative works
+   └─ Port to ASIC, different FPGA, custom hardware
+
+
+================================================================================
+                            WHAT YOU MUST DO
+================================================================================
+
+⚠ REQUIREMENTS - You MUST comply with these:
+
+1. SHARE YOUR CHANGES (if you distribute)
+   ├─ If you modify and distribute the code → must release source code
+   └─ Must be under AGPLv3 or compatible license
+
+2. INCLUDE LICENSE & ATTRIBUTION
+   ├─ Include original LICENSE file with your project
+   ├─ Keep copyright notices and attribution intact
+   └─ Document what you changed (prominently)
+
+3. NETWORK SERVICE CLAUSE (This is AGPLv3 specific!)
+   ├─ If you run this as a network service or online tool
+   ├─ Must provide users access to the modified source code
+   └─ This is the key difference from GPL
+
+4. NO WARRANTY / NO LIABILITY
+   ├─ Use at your own risk
+   ├─ Author provides NO guarantee it works
+   └─ You cannot sue if something fails
+
+
+================================================================================
+                        IS THIS "OPEN HARDWARE"?
+================================================================================
+
+Technically: YES
+──────────────
+
+AGPLv3 qualifies as open-source hardware:
+  ✓ Source code is available
+  ✓ You can inspect and modify
+  ✓ You can redistribute
+  ✓ Free to use for any purpose
+
+However, it's NOT the most permissive license:
+  • More restrictive than MIT, Apache, BSD licenses
+  • More complex than GPL (network service clause)
+  • Requires sharing modifications
+
+
+Common Open Hardware Licenses (for comparison):
+──────────────────────────────────────────────
+
+1. MIT License
+   ├─ Most permissive
+   ├─ You can do almost anything
+   ├─ Few restrictions
+   └─ Good for: Permissive projects
+
+2. Apache 2.0
+   ├─ Permissive with patent protection
+   ├─ Can use in commercial software
+   └─ Good for: Corporate projects
+
+3. GPL v3
+   ├─ Copyleft (share improvements)
+   ├─ Less restrictive than AGPL
+   └─ Good for: Desktop/desktop software
+
+4. AGPL v3 (THIS REPO) ← ← ← YOU ARE HERE
+   ├─ Copyleft + network clause
+   ├─ Must share improvements
+   ├─ If offered as service → must share source
+   └─ Good for: Community-driven projects
+
+5. Creative Commons (various)
+   ├─ For documentation, not usually code
+   └─ Less suitable for hardware
+
+
+================================================================================
+                        PRACTICAL SCENARIOS
+================================================================================
+
+SCENARIO 1: "I want to use it internally in my company"
+────────────────────────────────────────────────────────
+Status: ✓ ALLOWED
+Requirements:
+  ├─ Keep original license file
+  ├─ Keep copyright notices
+  ├─ Include attribution
+  └─ No requirement to share modifications (internal use only)
+
+Example: You port to ASIC for internal use → OK!
+
+
+SCENARIO 2: "I want to improve it and share with friends"
+──────────────────────────────────────────────────────────
+Status: ✓ ALLOWED (with conditions)
+Requirements:
+  ├─ Keep AGPLv3 license
+  ├─ Document your changes
+  ├─ Share source code with friends
+  ├─ They get same rights as you
+  └─ Include original copyright + your attribution
+
+Example: "I fixed bug X and optimized Y" → must share source
+
+
+SCENARIO 3: "I want to sell hardware with this design"
+─────────────────────────────────────────────────────
+Status: ⚠ COMPLICATED (possible but careful)
+Requirements:
+  ├─ You CAN charge for hardware
+  ├─ You MUST provide source code to customers
+  ├─ Customers get AGPLv3 rights
+  ├─ Any modifications must be documented
+  └─ Customers can modify and resell too
+
+Example: Manufacturing boards → must include source with product
+
+
+SCENARIO 4: "I want to offer this as an online service"
+─────────────────────────────────────────────────────────
+Status: ⚠ REQUIRES SOURCE SHARING (AGPLv3 network clause)
+Requirements:
+  ├─ If users access service remotely
+  ├─ You must let them download the source code
+  ├─ Including all your modifications
+  ├─ Keep it up-to-date with running version
+  └─ This is the "Affero" part of AGPL
+
+Example: "LZ4 Hardware-as-a-Service" → must provide source to users
+
+
+SCENARIO 5: "I want to relicense under MIT or Apache"
+───────────────────────────────────────────────────────
+Status: ✗ NOT ALLOWED
+Why:
+  ├─ You didn't write original code
+  ├─ Original author chose AGPL
+  ├─ You cannot change license unilaterally
+  ├─ Only original copyright holder can do that
+
+Workaround:
+  └─ Contact original author @weslay-koo and ask for permission
+
+
+================================================================================
+                    LEGAL SUMMARY TABLE
+================================================================================
+
+Use Case                        │ Allowed? │ Must Share Source?  │ Notes
+────────────────────────────────┼──────────┼────────────────────┼─────────────
+Internal company use            │ ✓ Yes    │ No                 │ Can keep proprietary
+Sell modified product           │ ✓ Yes    │ Yes (to customers) │ Network clause applies
+Offer as online service         │ ✓ Yes    │ Yes (to users)     │ AGPL network clause
+Share improvements with friends │ ✓ Yes    │ Yes (share source) │ Same license
+Relicense under MIT/Apache      │ ✗ No     │ N/A                │ Ask original author
+Use in closed-source product    │ ⚠ Maybe  │ Depends on link    │ Consult lawyer
+Reverse engineer / ignore license│ ✗ No    │ N/A                │ Illegal
+
+
+================================================================================
+                    WHAT THIS MEANS FOR YOUR PROJECT
+================================================================================
+
+IF YOU ARE JUST USING IT (no modifications):
+──────────────────────────────────────────
+
+✓ You can use immediately
+✓ No restrictions
+✓ Just include LICENSE file with attribution
+
+
+IF YOU ARE MODIFYING IT:
+──────────────────────
+
+Option A: Internal Use Only (Recommended for corporate)
+  ├─ Modify as much as you want
+  ├─ No need to share modifications
+  ├─ Just keep LICENSE file + attribution
+  └─ Must not distribute externally
+
+Option B: Share Your Improvements (Recommended for community)
+  ├─ Modify as you want
+  ├─ Release under AGPLv3 with source
+  ├─ Document what you changed
+  ├─ Include original LICENSE + attribution
+  └─ Anyone can use/modify your version too
+
+
+IF YOU WANT TO PORT TO ASIC:
+────────────────────────────
+
+✓ Completely allowed
+✓ No special restrictions
+✓ Just keep AGPLv3 license
+
+Options:
+  ├─ Keep as closed (internal use only)
+  │   └─ Include LICENSE file + attribution in HDL
+  │
+  ├─ Open-source the ASIC port (recommended)
+  │   ├─ Release RTL + place & route files
+  │   ├─ License under AGPLv3
+  │   └─ Contribute back to community
+  │
+  └─ Sell ASIC chips
+      ├─ Customers get source code
+      ├─ They can modify if they want
+      └─ Must be transparent about this
+
+
+================================================================================
+                        HOW TO COMPLY PROPERLY
+================================================================================
+
+If you want to use this legally, here's a checklist:
+
+FOR INTERNAL USE (simplest):
+───────────────────────────
+
+□ Copy the LICENSE file to your project
+□ Keep all copyright headers in source files
+□ Add attribution comment: "Based on LZ4_huffman_hardware by weslay-koo"
+□ Document your modifications (in comments or README)
+□ Do NOT distribute outside your company
+
+Required files to keep:
+  ├─ LICENSE (original AGPLv3 text)
+  ├─ README.md (document your changes)
+  └─ All .v files with copyright headers intact
+
+
+FOR DISTRIBUTION (complex):
+───────────────────────────
+
+□ Keep LICENSE file (AGPLv3 full text)
+□ Keep copyright headers in all files
+□ Add file header to modified files:
+    // Modified by: [Your name]
+    // Date: [Date]
+    // Changes: [Description of changes]
+
+□ Create CHANGES.md or CHANGELOG.md:
+    # Modifications
+    
+    - Original project: LZ4_huffman_hardware
+    - Original author: weslay-koo
+    - License: GNU Affero General Public License v3
+    
+    ## Your changes:
+    - Ported to ASIC (5 Nov 2025)
+    - Optimized hash multiplier (12 Nov 2025)
+    - etc.
+
+□ Host on GitHub/GitLab (or equivalent):
+    ├─ Include LICENSE file
+    ├─ Reference original repository
+    └─ Allow others to fork/modify
+
+□ If offering as service:
+    ├─ Provide download link to source
+    ├─ Keep it synchronized with running version
+    └─ Make prominent: "Source code available here"
+
+
+================================================================================
+                        RECOMMENDED APPROACH
+================================================================================
+
+Given that this is GPLv3 (restrictive), I recommend:
+
+FOR YOUR PROJECT:
+
+1. Contact original author (@weslay-koo on GitHub)
+   ├─ Ask to relicense under MIT or Apache 2.0
+   ├─ Many projects are willing to dual-license
+   └─ Then your project has more freedom
+
+2. Or, embrace the AGPL
+   ├─ Use it as-is (no relicensing needed)
+   ├─ Plan to release your improvements as open-source
+   ├─ Great for research/academic projects
+   └─ Good for community engagement
+
+3. Or, develop separately
+   ├─ Don't use this design
+   ├─ Create your own from scratch
+   └─ Full IP ownership
+
+
+================================================================================
+                        QUESTIONS TO ASK YOURSELF
+================================================================================
+
+Before using this design, answer these:
+
+□ Will I distribute this? (sell, publish, share?)
+  └─ YES → Must provide source code (AGPLv3 copyleft)
+  └─ NO → Can keep proprietary (internal use only)
+
+□ Will I modify it significantly?
+  └─ YES → Need to document changes clearly
+  └─ NO → Just include original license
+
+□ Will I offer it as a service (online)?
+  └─ YES → Must share source with users (AGPL network clause)
+  └─ NO → Less strict requirements
+
+□ Do I want to relicense under MIT/Apache?
+  └─ YES → Must contact @weslay-koo for permission
+  └─ NO → Just use AGPL as-is
+
+
+================================================================================
+                        CONCLUSION
+================================================================================
+
+✓ YES, this is open hardware
+
+✓ YES, you can use it in your project
+
+⚠ BUT, you must:
+   1. Keep the license file
+   2. Maintain attribution
+   3. Share improvements if you distribute
+   4. Provide source if offered as service
+
+✓ BEST PRACTICE:
+   1. Contact @weslay-koo to ask about dual-licensing
+   2. Document your modifications clearly
+   3. Plan to release improvements back to community
+   4. This builds reputation and community goodwill
+
+
+For detailed legal interpretation, consult:
+  • The full LICENSE file (662 lines)
+  • https://www.gnu.org/licenses/agpl-3.0.html
+  • Your company's legal team (if commercial use)
+
+================================================================================
