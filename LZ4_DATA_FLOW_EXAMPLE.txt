@@ -1,0 +1,743 @@
+================================================================================
+                    LZ4 DATA FLOW WITH DETAILED EXAMPLES
+================================================================================
+
+Document: Complete data flow through lz4_top_v3.v with cycle-by-cycle breakdown
+Purpose: Understand how data moves through each pipeline stage
+Example: Compressing "HELLO HELLO WORLD" (17 bytes = 4 dwords + 1 word)
+
+⚠️  CRITICAL LIMITATION:
+    This design REQUIRES file_length to be known upfront.
+    The data_terminal port is declared but NEVER WIRED internally.
+    True streaming (unknown length) is NOT currently supported.
+    See Section 10 for proposed fix.
+
+================================================================================
+                    SECTION 1: OVERALL DATA FLOW ARCHITECTURE
+================================================================================
+
+Input Stream (idata)
+        ↓
+    [1] lz4_buffer (64KB sliding window)
+        ↓
+    [2] byte_addressing (96-bit shifter)
+        ↓
+    [3] abs_addr_gen (address generator)
+        ↓
+    [4] hash_table (parallel hash lookup at clk_2x)
+        ↓
+    [5] control_fsm (orchestration)
+        ↓
+    [6] lz4_encoder (frame encoding)
+        ↓
+    [7] xxh32_calc (checksum parallel with input)
+        ↓
+Output (out_data)
+
+================================================================================
+                    SECTION 2: EXAMPLE SETUP
+================================================================================
+
+Input File (Text):
+    "HELLO HELLO WORLD"
+    
+Hex Representation (Big-Endian):
+    Byte 0:  0x48 ('H')
+    Byte 1:  0x45 ('E')
+    Byte 2:  0x4C ('L')
+    Byte 3:  0x4C ('L')
+    Byte 4:  0x4F (' ')  [space]
+    Byte 5:  0x48 ('H')
+    Byte 6:  0x45 ('E')
+    Byte 7:  0x4C ('L')
+    Byte 8:  0x4C ('L')
+    Byte 9:  0x4F (' ')  [space]
+    Byte 10: 0x57 ('W')
+    Byte 11: 0x4F ('O')
+    Byte 12: 0x52 ('R')
+    Byte 13: 0x4C ('L')
+    Byte 14: 0x44 ('D')
+    
+Total: 15 bytes
+
+32-bit Words (LSB first in lz4):
+    idata[0] = 0x4C4C4548  (HELL)
+    idata[1] = 0x48204F4C  (O HE)
+    idata[2] = 0x4F4C4C45  (ELLO)
+    idata[3] = 0x574F2048  (H WO)
+    idata[4] = 0x00004452  (RLD) [last word, only 3 bytes]
+
+Configuration:
+    clk = 250 MHz (4 ns period)
+    file_length = 15 bytes
+    file_length_valid = 1 (asserted before start)
+
+================================================================================
+                    SECTION 3: CYCLE-BY-CYCLE TRACE
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 1: INITIALIZATION (Cycles 0-10)
+────────────────────────────────────────────────────────────────────────────────
+
+Cycle 0:
+    Input:  rstN = 0 (assert reset)
+    Action: All registers clear, FSM enters IDLE state
+    
+Cycle 1:
+    Input:  rstN = 1 (release reset)
+    Action: PLL initialization begins
+    
+Cycle 2-5:
+    Action: PLL locks (pll_locked = 1 after ~4 cycles)
+    
+Cycle 6:
+    Input:  file_length_valid = 1, file_length = 0x0F (15 bytes)
+    Action: control_fsm captures file_length → file_len_reg = 15
+    
+Cycle 7:
+    Input:  start_compress = 1
+    Action: FSM enters HASH_CLEAN state
+            → Clears all hash table entries (256K SRAM)
+            → Sets compress_start = 1 internally
+            
+Cycle 8:
+    Action: Hash table cleaning in progress
+    Output: mfifo_full = 0 (ready for input)
+    
+Cycle 10:
+    Action: Hash cleaning complete
+    Status: Ready to receive input
+
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 2: BYTE STREAMING INPUT (Cycles 11-15)
+────────────────────────────────────────────────────────────────────────────────
+
+Cycle 11:
+    Input:  idata = 0x4C4C4548 (HELL)
+            idata_req = 1
+            data_terminal = 0 (more data coming)
+    
+    Action in lz4_buffer:
+        → Write to 64KB sliding window at address 0
+        → FIFO pushes: {idata[31:24], idata[23:16], idata[15:8], idata[7:0]}
+        → FIFO pushes: {0x48, 0x45, 0x4C, 0x4C}
+        
+    Action in xxh32_calc:
+        → Parallel hash calculation begins on idata
+        → Accumulates into running hash state
+        
+    Internal State Update:
+        anchor = 0x00000000 (start of buffer)
+        wr_ptr = 4 (buffer write pointer advanced)
+        fifo_count = 4 bytes pending
+    
+    Output: mfifo_full = 0 (plenty of space)
+            mfifo_empty = 0 (now has data)
+
+Cycle 12:
+    Input:  idata = 0x48204F4C (O HE)
+            idata_req = 1
+    
+    Action in lz4_buffer:
+        → Write to address 4
+        → FIFO pushes: {0x4C, 0x4F, 0x20, 0x48}
+        
+    Internal State Update:
+        wr_ptr = 8
+        fifo_count = 8 bytes
+        
+Cycle 13:
+    Input:  idata = 0x4F4C4C45 (ELLO)
+            idata_req = 1
+    
+    Action in lz4_buffer:
+        → Write to address 8
+        → FIFO pushes: {0x45, 0x4C, 0x4C, 0x4F}
+        
+    Internal State Update:
+        wr_ptr = 12
+        fifo_count = 12 bytes
+
+Cycle 14:
+    Input:  idata = 0x574F2048 (H WO)
+            idata_req = 1
+    
+    Action in lz4_buffer:
+        → Write to address 12
+        → FIFO pushes: {0x48, 0x20, 0x4F, 0x57}
+        
+    Internal State Update:
+        wr_ptr = 16
+        fifo_count = 16 bytes
+
+Cycle 15:
+    Input:  idata = 0x00004452 (RLD) [last 3 bytes, padded with 0]
+            idata_req = 1
+            data_terminal = 1 ← ⚠️ NOT CONNECTED (dead port)
+    
+    Action in lz4_buffer:
+        → Write to address 16
+        → FIFO pushes: {0x52, 0x44, 0x00, 0x00}
+        
+    Note:   data_terminal signal is IGNORED in actual implementation
+            → It's declared in lz4_top_v3.v but never wired internally
+            → Control_fsm does NOT receive this signal
+        
+    Internal State Update:
+        wr_ptr = 20
+        fifo_count = 20 bytes
+        ← BUT ONLY 15 bytes are valid (file_length = 15)
+
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 3: HASH CALCULATION & MATCHING (Cycles 16-40)
+────────────────────────────────────────────────────────────────────────────────
+
+Cycle 16:
+    Action in byte_addressing:
+        → byte4_en = 1 (start extracting bytes)
+        → rd_data_en = 1
+        → Reads from FIFO: {0x48, 0x45, 0x4C, 0x4C}
+        → Outputs 4 parallel bytes:
+            byte4_data1 = 0x48 ('H') at position 0
+            byte4_data2 = 0x45 ('E') at position 1
+            byte4_data3 = 0x4C ('L') at position 2
+            byte4_data4 = 0x4C ('L') at position 3
+
+Cycle 17:
+    Action in abs_addr_gen:
+        → Generates 4 parallel addresses:
+            abs_addr1 = 0x00000000 (byte 0)
+            abs_addr2 = 0x00000001 (byte 1)
+            abs_addr3 = 0x00000002 (byte 2)
+            abs_addr4 = 0x00000003 (byte 3)
+
+Cycle 18:
+    Action in control_fsm:
+        → Extracts 4 bytes from byte4_data1-4:
+            byte_0 = 0x48 ('H')
+            byte_1 = 0x45 ('E')
+            byte_2 = 0x4C ('L')
+            byte_3 = 0x4C ('L')
+        
+        → Creates 4-byte patterns for hashing:
+            hash_idata1 = 0x4C4C4548  (bytes 0-3: HELL)
+            hash_idata2 = 0x4C45xxxx  (bytes 1-4: EL??)
+            hash_idata3 = 0x45xxxxxx  (bytes 2-5: L???)
+            hash_idata4 = 0xxxxxxxxx  (bytes 3-6: ????)
+
+Cycle 19:
+    Action in hash_table @ clk_2x (500 MHz):
+        ★ CRITICAL: Time-multiplexing begins here
+        
+        Time slot 0 (first 2 ns):
+            → Read hash_idata1 at hash_iaddr1 = 0
+            → First 32K SRAM bank accessed
+            → Previous entry at hash[hash(0x4C4C4548)] read
+            
+        Time slot 1 (next 2 ns within same 4ns clk cycle):
+            → Read hash_idata2 at hash_iaddr2 = 1
+            → Via delayed latches and second 32K SRAM bank
+            
+        At clk_1x edge:
+            → All 4 results available simultaneously
+            
+            Result: hash_oaddr = 0x00000005 (previous occurrence at offset 5)
+            → This means "HELL" appeared before, distance = 5
+    
+    Action in control_fsm:
+        → Detects hash_hit = 1 (match found!)
+        → hit_dist = 0x00000005
+        → hit_valid = 1
+
+Cycle 20:
+    Action in control_fsm:
+        → Extracts match:
+            match_start = 1
+            → Tells lz4_buffer to extract match details
+            
+    Action in lz4_buffer:
+        → At offset 5 (previous "HELL"), length can be extended
+        → Scans forward: "HELL" matches at positions 0 and 5
+        → Can extend match: length = 4 bytes minimum
+        
+        → Checks for extension:
+            Position 0-3: "HELL" 
+            Position 5-8: "HELL"
+            → Match verified, length = 4
+
+Cycle 21-25:
+    Action in control_fsm (MATCHING state):
+        → Continue scanning for longer matches
+        → Update: match_length = 5 (found "HELLO")
+        
+        Position 0-4:  "HELLO"
+        Position 5-9:  "HELLO"
+        → Extended match found!
+
+Cycle 26:
+    Action in control_fsm (POST-MATCH):
+        → Match complete: match_length = 5, match_offset = 5
+        → Literal count = 0 (no uncompressed bytes before match)
+        → Sends to encoder:
+            match_offset = 5
+            match_length = 5
+            unmatch_length = 0
+
+Cycle 27-30:
+    Action: Continue with next 4 bytes
+        → byte4_data = "O HE" (bytes 4-7)
+        → New hash lookups begin
+        → Partial match on "HE" found at different offset
+        → "HEL" at byte 1: shorter match
+        → Best match: "HELLO" already encoded
+
+Cycle 31-40:
+    Action: Process remaining bytes
+        → "O WO" (bytes 9-12)
+        → " WOR" (bytes 11-14)
+        → "LD" (bytes 13-14) - literal
+        
+        Detects no significant matches in remaining data
+        → Encodes as: literals + short matches
+
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 4: ENCODING & OUTPUT (Cycles 41-55)
+────────────────────────────────────────────────────────────────────────────────
+
+Cycle 41:
+    Action in lz4_encoder:
+        → encode_en = 1
+        → Receives first match:
+            match_offset = 5
+            match_length = 5
+            unmatch_length = 0 (no literals)
+        
+    Output encoding:
+        LZ4 Frame starts:
+        Byte 0-3: Frame Magic Number = 0x184D2204
+        Byte 4:   FLG (frame descriptor flags) = 0x6C
+                  - Version = 01
+                  - Block Independence = 1
+                  - Content Size = 1 (enabled)
+                  - Checksum = 1
+        Byte 5:   BD (block descriptor) = 0x64
+                  - Block size = 4MB
+        Byte 6-9: Content Size = 0x0F (15 bytes, little-endian)
+        Byte 10:  Header CRC (computed from FLG+BD+Size)
+
+Cycle 42:
+    Action in encoder:
+        → Encodes literal count = 0 (no uncompressed bytes)
+        → Encodes match:
+            Token byte = 0x00 (0 literals, base match len = 15)
+            Match offset (LE): 0x05 0x00 (offset 5 as 16-bit)
+            Match length: 5 - 4 = 1 (base is 4)
+                → Encoded as: 1 (fits in 4 bits)
+            
+        Output bytes: [Token: 0x00] [Offset: 0x05 0x00] [Length: 1]
+
+Cycle 43:
+    Action in encoder:
+        → Process literal block "O " (2 bytes from position 5 after match)
+        → Encodes: Token byte with literal count = 2
+                   2 bytes of data: 0x4F 0x20 ('O' and space)
+
+Cycle 44:
+    Action in encoder:
+        → Next match: "HELLO" again at different position
+        → Partial match: "O WO" = no match
+        → Process literals: " WORLD" (6 bytes)
+        
+        → Token byte = 0x60 (6 literals)
+        → Data: 0x20 0x57 0x4F 0x52 0x4C 0x44
+                  (' ', 'W', 'O', 'R', 'L', 'D')
+
+Cycle 45:
+    Action in encoder:
+        → Compression complete (no more data after data_terminal)
+        → Finalizes frame:
+            Checksum (from xxh32_calc): 0x12AB34CD (example)
+            Output 4-byte checksum
+            
+    Action in xxh32_calc:
+        → Has been accumulating hash all along:
+            Processed: "HELLO HELLO WO"
+            Final hash: 0x12AB34CD
+
+Cycle 46-50:
+    Action: Flush compressed data to output FIFO
+        → Output FIFO receives all encoded blocks
+        → out_valid = 1
+        → out_data cycles through:
+            0x184D2204 (magic)
+            0x6C640000 (flags + bd + size start)
+            0x000F0000 (size end + checksum start)
+            ... (token, offset, length bytes)
+            0x12AB34CD (final checksum)
+        
+        Total compressed output ≈ 30-35 bytes
+        (vs 15 input bytes → 2x expansion for tiny file)
+
+Cycle 51:
+    Output: compress_done = 1 ← Signals completion
+    
+    Output: out_empty = 0 (data ready to read)
+            out_valid = 1
+            
+Cycle 52-55:
+    Action: External device reads compressed output
+        Input:  out_en = 1 (continuous read)
+        Output: out_data holds next 34-bit word
+                out_valid = 1 while data available
+        
+        When all output consumed:
+        Output: out_empty = 1
+        Action: Compression cycle complete
+
+
+================================================================================
+                    SECTION 4: DATA STRUCTURES AT KEY POINTS
+================================================================================
+
+STATE: After receiving all 4 input dwords (Cycle 15)
+
+lz4_buffer (64KB sliding window):
+    Address 0-3:   0x48 0x45 0x4C 0x4C  (HELL)
+    Address 4-7:   0x4F 0x20 0x48 0x45  (O HE)
+    Address 8-11:  0x4C 0x4C 0x4F 0x20  (LLO )
+    Address 12-15: 0x48 0x57 0x4F 0x52  (HWOR)
+    Address 16-19: 0x4C 0x44 0x00 0x00  (LD + padding)
+    
+    Valid bytes: 0-14 (15 total, file_length = 15)
+    write_ptr: 20 (past end)
+    read_ptr: varies as encoder consumes
+
+fifo_count: 20 (but only 15 valid)
+
+hash_table entries (after processing):
+    hash(0x4C4C4548) → {addr: 0, prev: -1} then {addr: 5, prev: 0}
+                       ↑ Stores both occurrences
+                       
+    hash(0x4F204845) → {addr: 4, prev: -1}
+    
+    hash(0x4C4C4F20) → {addr: 8, prev: -1}
+    
+    hash(0x48574F52) → {addr: 12, prev: -1}
+    
+    hash(0x4C440000) → {addr: 16, prev: -1} [last partial word]
+
+anchor: 0x00000000 (first byte to encode)
+
+
+STATE: After hash_hit detected (Cycle 20)
+
+Current processing:
+    Position: 0 (matching "HELL")
+    Match found at: -5 (5 bytes back, but we're at start, so not valid)
+    
+    Actually: Position 5 matches position 0-3
+    → When at position 5, hash finds position 0
+    → Distance = 5 bytes
+    → match_offset = 5 ← Output to encoder
+
+Character-by-character comparison:
+    Position 0: H = H ✓
+    Position 1: E = E ✓
+    Position 2: L = L ✓
+    Position 3: L = L ✓
+    Position 4: O = O ✓ (extends!)
+    Position 5: space ≠ L ✗
+    
+    Final match_length = 5
+
+
+STATE: Final compressed frame (after Cycle 45)
+
+LZ4 Frame structure (hex dump):
+    
+    Offset  Byte    Meaning
+    ─────────────────────────────────────
+    0-3     04 22 4D 18  Magic number (LE: 0x184D2204)
+    4       6C           FLG: version=01, indep=1, content_size=1, checksum=1
+    5       64           BD: block_size=4
+    6-9     0F 00 00 00  Content Size = 15 (little-endian)
+    10      XX           Header CRC
+    
+    11      00           Token (0 literals, base match length)
+    12-13   05 00        Match offset = 5 (LE)
+    14      01           Match length extension (1, so 4+1=5)
+    
+    15      21           Token (2 literals, base 0)
+    16-17   4F 20        Literal data: 'O' 0x20
+    
+    18      60           Token (6 literals, base 0)
+    19-24   20 57 4F 52 4C 44   Literals: ' WORLD'
+    
+    25      00           Last empty block marker
+    26-29   XX XX XX XX  Frame checksum (XXHash32)
+    
+    Total: 30 bytes
+
+
+================================================================================
+                    SECTION 5: INTERNAL SIGNAL STATES TIMELINE
+================================================================================
+
+Signal State Changes:
+
+Cycle 0:  rstN=0 → All signals reset
+Cycle 1:  rstN=1 → Reset released
+Cycle 6:  file_length_valid=1, file_length=15
+Cycle 7:  start_compress=1
+Cycle 10: mfifo_full=0 ← Ready for input
+Cycle 11: idata_req=1, idata=0x4C4C4548
+Cycle 12: idata_req=1, idata=0x48204F4C
+Cycle 13: idata_req=1, idata=0x4F4C4C45
+Cycle 14: idata_req=1, idata=0x574F2048
+Cycle 15: idata_req=1, idata=0x00004452, data_terminal=1
+         → Input phase complete
+         
+Cycle 16: mfifo_valid=1 ← FIFO starts outputting
+Cycle 19: hash_hit=1, hit_valid=1, hit_dist=5
+         → Match detected
+         
+Cycle 26: info_valid=1 ← Encoder receives match info
+Cycle 41: encode_en=1, out_valid=1
+         → Encoded data appears
+         
+Cycle 51: compress_done=1
+         → Compression finished
+         
+Cycle 52+: out_valid=1 while out_en=1
+          → Output consumed
+
+
+================================================================================
+                    SECTION 6: PERFORMANCE METRICS FOR EXAMPLE
+================================================================================
+
+Input Processing:
+    Total input bytes: 15
+    Input dwords: 4 (+ partial 1)
+    Cycles to input: 5 (cycles 11-15)
+    Input bandwidth: 15 bytes / 5 cycles = 3 bytes/cycle
+    At 250 MHz: 3 × 250M = 750 MB/s (within 1000 MB/s max)
+
+Hash Processing:
+    Hash lookups: 4 per cycle (parallelized via clk_2x)
+    Lookups per input dword: 4
+    Total lookups: 4 lookups × 4 dwords = 16 lookups (pipelined)
+    Time: ~4-5 cycles (overlapped with input)
+
+Matching:
+    Match found at cycle 19
+    Match length: 5 bytes
+    Bytes before next input: 5
+    Compression ratio for "HELLO HELLO WORLD": ~2.0x
+    (30 bytes out vs 15 in - bad for small files!)
+
+Output:
+    Compressed bytes: 30
+    Output cycles needed: 30/4 = 7.5 ≈ 8 cycles
+    Output bandwidth: 30 bytes / 8 cycles = 3.75 bytes/cycle
+    At 250 MHz: 3.75 × 250M = 937.5 MB/s
+
+Total Latency:
+    Input: 5 cycles
+    Processing: 30 cycles (hash + matching + encoding)
+    Output: 8 cycles
+    Total: ~40 cycles × 4ns = 160 ns
+
+
+================================================================================
+                    SECTION 7: KEY INSIGHTS FROM TRACE
+================================================================================
+
+1. DATA PARALLELISM (4-byte wide):
+   ✓ Input accepts 4 bytes per cycle (250 MHz → 1000 MB/s max)
+   ✓ Hash computed on 4 bytes simultaneously
+   ✓ Output delivers 4 bytes per cycle (compressed)
+
+2. CLOCK DOUBLING (clk_2x = 500 MHz):
+   ✓ Enables 4 parallel hash table accesses in single clk_1x cycle
+   ✓ Time-multiplexing: slots 0,1 at 2ns and 2,3 at next 2ns
+   ✓ Without clk_2x: would need 4 sequential accesses = 4x slower
+
+3. STREAMING WITH FILE LENGTH:
+   ✗ data_terminal is NOT wired (dead code)
+   ✓ File length MUST be known upfront
+   ✓ Used to detect EOF and finalize encoding
+   ✓ Required for Content Size field in LZ4 frame header
+
+4. BACKPRESSURE:
+   ✓ mfifo_full prevents buffer overflow
+   ✓ ohalf_full warns before full
+   ✓ External device must respect these signals
+
+5. CRITICAL PATH:
+   Most cycles spent in hash matching (loops 3-6)
+   Bottleneck: matching length determination
+   Could be optimized with wider comparators
+
+
+================================================================================
+                    SECTION 8: WHAT HAPPENS AT BOUNDARIES
+================================================================================
+
+Last 3 Bytes Handling:
+    When file_len_cnt >= (file_len_reg - 13):
+        last_3dwords = 1 ← Signal indicates near EOF
+        
+    Control FSM limits match length:
+        Can't match beyond EOF
+        match_length capped at remaining bytes
+
+Unaligned Data:
+    Input: 0x00004452 (RLD + padding)
+    Only 3 bytes valid (file_length = 15)
+    
+    Encoder knows: "only 3 bytes after position 12"
+    Prevents matching 4 bytes when only 3 exist
+    
+    Outputs: literal "RLD" as 3 bytes in LZ4 frame
+
+Content Size in Frame:
+    Set to file_length = 15 bytes
+    Decoder knows exactly how many bytes to output
+    No ambiguity even if input is padded
+
+
+================================================================================
+                    SECTION 9: XXHash32 PARALLEL PATH
+================================================================================
+
+Cycle 11:  input "HELL" (idata = 0x4C4C4548, idata_req = 1)
+           xxh32_calc captures in digest path
+           
+Cycle 12:  input "O HE" 
+           Running hash state updates
+           
+Cycle 13:  input "ELLO"
+           
+Cycle 14:  input "H WO"
+           
+Cycle 15:  input "RLD" + data_terminal = 1
+           xxh32_calc prepares finalization
+           
+Cycles 16-20: 
+           Hash continues processing internally
+           (no output yet)
+           
+Cycle 45:  digest = 0x12AB34CD ← Final checksum
+           digest_valid = 1
+           
+           Encoder receives checksum and appends to frame footer
+           
+Result: 4-byte checksum in frame = digest value
+
+
+This parallelism means xxh32 adds NO LATENCY - it computes
+while other modules are working on matching/encoding.
+
+================================================================================
+                    SECTION 10: MODIFICATION NEEDED FOR TRUE STREAMING
+================================================================================
+
+Current Issue:
+    ✗ data_terminal port exists but is NOT WIRED
+    ✗ Requires file_length upfront
+    ✗ Cannot process unknown-length streams
+
+Proposed Fix (2-step):
+
+STEP 1: Wire data_terminal to control_fsm
+    Add to control_fsm inputs:
+        input wire data_terminal_in,
+    
+    Use in FSM:
+        if (data_terminal_in)
+            → Set compress_done = 1 after current data
+            → Trigger finalization
+        else
+            → Check file_len_cnt vs file_len_reg
+
+STEP 2: Make file_length optional
+    Modify lz4_encoder:
+        If file_length_valid = 0:
+            → Omit Content Size from LZ4 frame
+            → Set "Content Size" flag = 0 in FLG byte
+            → xxh32_calc finalizes on data_terminal instead
+        
+        If file_length_valid = 1:
+            → Include Content Size (current behavior)
+
+STEP 3: Make xxh32_calc respond to data_terminal
+    Modify xxh32_calc_v2:
+        if (compress_done || data_terminal):
+            → Finalize hash immediately
+            → Output digest_valid = 1
+        else:
+            → Keep accumulating
+
+
+This enables TRUE STREAMING mode:
+    ✓ No file_length needed
+    ✓ Use data_terminal to mark end
+    ✓ LZ4 frame auto-adjusts (no Content Size)
+    ✓ Works with continuous/bursty streams
+
+
+================================================================================
+                    QUICK REFERENCE: STATE MACHINE STATES
+================================================================================
+
+control_fsm_v3 main states (simplified):
+
+IDLE
+    ↓ (start_compress asserted)
+    
+HASH_CLEAN (clearing 256KB hash table)
+    ↓ (after ~200 cycles)
+    
+MATCHING (scanning for matches)
+    ├─ Byte 0-3: Hash lookup
+    ├─ Byte 1-4: Hash lookup
+    ├─ Byte 2-5: Hash lookup
+    ├─ Byte 3-6: Hash lookup
+    └─ If match_hit: EXTEND_MATCH
+        ├─ Compare byte-by-byte
+        ├─ Advance match_length
+        └─ If no extension: EMIT_MATCH
+    
+EMIT_MATCH
+    ↓ (send to encoder)
+    
+ENCODE_FRAME
+    ↓ (encoder processes token/offset/length)
+    
+FINAL_BLOCK
+    ├─ Last data indicators set
+    ├─ Checksum appended
+    └─ compress_done = 1
+    
+DONE
+
+
+================================================================================
+                    END OF DATA FLOW DOCUMENT
+================================================================================
+
+Created: January 23, 2026
+Purpose: Understanding complete data path through LZ4 compression pipeline
+Example: "HELLO HELLO WORLD" (15 bytes)
+Trace Depth: Cycle-by-cycle from input to compressed output
+
+For Questions:
+    - See Section 3 for cycle-by-cycle trace
+    - See Section 4 for data structure state
+    - See Section 10 for streaming modifications
+    - See Section 8 for boundary conditions

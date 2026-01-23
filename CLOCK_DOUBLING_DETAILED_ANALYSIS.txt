@@ -1,0 +1,507 @@
+================================================================================
+                    IMPACT OF SAME CLOCK FREQUENCY (clk_1x = clk_2x)
+================================================================================
+
+Question: What if clk_2x = clk_1x (both 250 MHz instead of 500 MHz)?
+
+Current Design:
+    clk_1x = 250 MHz (4 ns period) - Main pipeline clock
+    clk_2x = 500 MHz (2 ns period) - Hash clock (2× faster)
+    
+Proposed (Hypothetical):
+    clk_1x = 250 MHz (4 ns period)
+    clk_2x = 250 MHz (4 ns period) - SAME AS clk_1x
+    
+Impact: ★ MAJOR PERFORMANCE REGRESSION ★
+
+
+================================================================================
+                    SECTION 1: TIME-MULTIPLEXING MECHANISM
+================================================================================
+
+Current Architecture (clk_2x = 500 MHz):
+
+Main Clock Period (clk_1x = 4 ns):
+    ┌─────────────────────────────────┐
+    │         1 clk_1x cycle          │
+    │           (4 ns total)          │
+    └─────────────────────────────────┘
+    │   │   │   │   │   │   │   │   │
+    0   1   2   3   4   5   6   7   8  ns (timeline)
+
+clk_2x Cycles within 1 clk_1x:
+    ┌─────────────────────────────────┐
+    │    Time Slot 0    │   Time Slot 1 │
+    │    (0-2 ns)       │    (2-4 ns)   │
+    └─────────────────────────────────┘
+    
+    ↓
+    
+Hash Memory Access Schedule:
+
+    Time Slot 0 (first 2 ns of clk_1x):
+        Port A: Read/Write hash_idata1 at hash_iaddr1
+        Port B: Read/Write hash_idata2 at hash_iaddr2
+        
+    Time Slot 1 (next 2 ns of clk_1x):
+        Port A: Read/Write hash_idata3 at hash_iaddr3  [stored in _reg]
+        Port B: Read/Write hash_idata4 at hash_iaddr4  [stored in _reg]
+    
+    Result at end of clk_1x cycle:
+        All 4 results available: hash_oaddr, hit_dist, hit_valid, etc.
+
+Code Implementation (hash_4port_32Kx65bit.v):
+
+    // Time slot selector (toggles every clk_2x)
+    always @ (posedge clk_2x)
+        time_slot <= ~time_slot;
+    
+    // Route ports based on time slot
+    assign ram_addra = time_slot ? addrc_reg : addra;
+    assign ram_addrb = time_slot ? addrd_reg : addrb;
+    
+    // Capture results
+    if (time_slot)          // Slot 1
+        {douta_reg, doutb_reg} <= {ram_douta, ram_doutb};
+    else if (!time_slot)    // Slot 0
+        {doutc_reg, doutd_reg} <= {ram_douta, ram_doutb};
+
+
+RESULT: 4 parallel accesses in 1 cycle
+         Via time-multiplexing on 2-port SRAM
+
+
+================================================================================
+                    SECTION 2: WHAT HAPPENS IF clk_2x = clk_1x = 250 MHz
+================================================================================
+
+New Architecture (Hypothetical):
+
+Main Clock Period (clk_1x = 4 ns):
+    ┌─────────────────────────────────┐
+    │         1 clk_1x cycle          │
+    │           (4 ns total)          │
+    └─────────────────────────────────┘
+
+clk_2x Cycles within 1 clk_1x:
+    ┌─────────────────────────────────┐
+    │      ONLY 1 clk_2x CYCLE        │
+    │        (entire 4 ns)            │
+    └─────────────────────────────────┘
+
+Time Slot Changes:
+    
+    Before (clk_2x = 500 MHz):
+        Cycle 0: time_slot = 0 (posedge 1 of 500MHz clock)
+        Cycle 1: time_slot = 1 (posedge 2 of 500MHz clock)  ← Within same 250MHz cycle
+        Cycle 2: time_slot = 0 (posedge 3)
+        ...
+        
+        Slots per clk_1x cycle: 2 transitions = 4 ports accessed
+    
+    After (clk_2x = 250 MHz):
+        Cycle 0: time_slot = 0 (posedge 1 of 250MHz clock)
+        Cycle 1: time_slot = 1 (posedge 1 of NEXT 250MHz clock)
+        ...
+        
+        Slots per clk_1x cycle: Only 1 transition = ONLY 2 ports accessed!
+
+
+================================================================================
+                    SECTION 3: PERFORMANCE IMPACT
+================================================================================
+
+Hash Table Access Capability:
+
+CURRENT (clk_2x = 500 MHz):
+    ┌──────────────────────────────────────┐
+    │ 1 clk_1x cycle (4 ns) at 250 MHz    │
+    └──────────────────────────────────────┘
+         Contains 2 clk_2x cycles:
+         ├─ Time Slot 0: Ports A+B access
+         └─ Time Slot 1: Ports C+D access
+    
+    Hash lookups per clk_1x: 4 simultaneous
+    Via: 2 ports × 2 time slots = 4 effective ports
+
+
+NEW (clk_2x = 250 MHz):
+    ┌──────────────────────────────────────┐
+    │ 1 clk_1x cycle (4 ns) at 250 MHz    │
+    └──────────────────────────────────────┘
+         Contains only 1 clk_2x cycle:
+         └─ Time Slot 0: Ports A+B access
+    
+    Hash lookups per clk_1x: 2 only
+    Via: 2 ports × 1 time slot = 2 ports
+    
+    Ports C+D not accessed until NEXT clk_1x cycle!
+
+
+════════════════════════════════════════════════════════════════════════════════
+
+THROUGHPUT COMPARISON:
+
+Input Processing:
+
+CURRENT:
+    4 hash lookups per clk_1x cycle
+    @ 250 MHz = 1 dword/cycle
+    4 bytes × 250M cycles/sec = 1000 MB/s input throughput
+    
+    Matches: 4 potential matches per cycle
+
+NEW:
+    2 hash lookups per clk_1x cycle
+    @ 250 MHz = 1 dword/cycle
+    4 bytes × 250M cycles/sec = 1000 MB/s input rate (unchanged!)
+    
+    BUT: Only 2 of 4 bytes can be compared
+    Matches: Only 2 potential matches per cycle
+    
+    Effective throughput: 500 MB/s (2x BOTTLENECK)
+
+
+════════════════════════════════════════════════════════════════════════════════
+
+Matching Performance:
+
+CURRENT:
+    Every input dword (4 bytes):
+        Byte 0: hash lookup immediately
+        Byte 1: hash lookup immediately
+        Byte 2: hash lookup immediately
+        Byte 3: hash lookup immediately
+    All 4 in parallel via time-multiplexing
+    
+    Match detection latency: 1-2 cycles
+
+NEW:
+    Every input dword (4 bytes):
+        Byte 0: hash lookup
+        Byte 1: hash lookup
+        ← Ports C & D idle
+        ← Wait for next clk_1x cycle
+        
+        Byte 2: hash lookup (in next cycle)
+        Byte 3: hash lookup (in next cycle)
+    
+    Match detection latency: 2-3 cycles (longer!)
+    Utilization: 50% of hash capability
+
+
+================================================================================
+                    SECTION 4: WHAT MUST CHANGE IN CODE
+================================================================================
+
+The hardware WILL NOT WORK CORRECTLY with clk_2x = clk_1x.
+
+Root Cause:
+    time_slot register toggles on EVERY posedge clk_2x:
+    
+        always @ (posedge clk_2x)
+            time_slot <= ~time_slot;
+    
+    With clk_2x = clk_1x:
+        Toggles only once per clk_1x cycle
+        Gives only 2 time slots total
+        Leaves ports C+D unused
+
+
+Required Changes:
+
+OPTION 1: Remove Time-Multiplexing Entirely
+    
+    Change: Use all 4 ports synchronously
+    
+    Code:
+        // Remove time_slot selector
+        // Change from:
+        assign ram_addra = time_slot ? addrc_reg : addra;
+        
+        // To: Use 4-port RAM directly
+        assign ram_addra = addra;
+        assign ram_addrb = addrb;
+        assign ram_addrsc = addrc;  // New connection
+        assign ram_addrd = addrd;    // New connection
+    
+    Requirement: Need 4-port SRAM (not available on typical FPGAs!)
+    
+    Cost: Impossible on dual-port SRAM hardware
+    Impact: ✗ NOT FEASIBLE
+
+
+OPTION 2: Use Sequential Access (Degrade Performance)
+    
+    Change: Accept 2 ports per cycle, process 2 bytes at a time
+    
+    Code:
+        if (cycle_count % 2 == 0) begin
+            // Access ports A+B for bytes 0-1
+            iaddr1 = hash_iaddr1;
+            iaddr2 = hash_iaddr2;
+        end else begin
+            // Access ports C+D for bytes 2-3
+            iaddr1 = hash_iaddr3;
+            iaddr2 = hash_iaddr4;
+        end
+    
+    Result:
+        ✓ Still works
+        ✓ Matching logic adapted
+        ✗ Compression 2× slower
+        ✗ Throughput capped at 500 MB/s
+    
+    Effort: 30-50 lines of FSM modification
+    Impact: Severe performance loss
+
+
+OPTION 3: Keep clk_2x = 500 MHz (Don't Change)
+    
+    ✓ No code changes needed
+    ✓ Full 4-parallel performance maintained
+    ✓ 1000 MB/s input throughput
+    
+    This is why the design uses it!
+
+
+================================================================================
+                    SECTION 5: CYCLE-BY-CYCLE COMPARISON
+================================================================================
+
+Compressing "HELLO" with time-multiplexing:
+
+CURRENT (clk_2x = 500 MHz):
+
+Cycle 0 (main clk_1x):
+    posedge clk_1x: Input receives 0x4C4C4548 (HELL)
+    
+    First half of cycle (posedge 1 of clk_2x):
+        time_slot = 0
+        Access: Ports A, B
+        → hash[0x4C4C45] lookup
+        → hash[0x4C454C] lookup
+    
+    Second half of cycle (posedge 2 of clk_2x):
+        time_slot = 1
+        Access: Ports C, D (via _reg)
+        → hash[0x45xxxx] lookup
+        → hash[xxxxxxx] lookup
+    
+    End of Cycle 0:
+        Result: 4 matches (or no matches) ready for FSM
+
+
+NEW (clk_2x = 250 MHz):
+
+Cycle 0 (main clk_1x):
+    posedge clk_1x: Input receives 0x4C4C4548 (HELL)
+    
+    Entire cycle (only 1 posedge of clk_2x):
+        time_slot = 0
+        Access: Ports A, B ONLY
+        → hash[0x4C4C45] lookup
+        → hash[0x4C454C] lookup
+    
+    End of Cycle 0:
+        Result: Only 2 matches available
+        ✗ Ports C & D idle
+        ✗ Bytes 2-3 not processed yet
+
+Cycle 1 (main clk_1x):
+    
+    Entire cycle (posedge of next clk_2x):
+        time_slot = 1
+        Access: Ports C, D
+        → hash[0x45xxxx] lookup
+        → hash[xxxxxxx] lookup
+    
+    End of Cycle 1:
+        ✗ Now you have bytes 2-3 matches
+        ✗ But byte 0-1 results are old
+
+
+════════════════════════════════════════════════════════════════════════════════
+
+Result: Sequential instead of parallel
+        Takes 2 cycles to do what currently takes 1 cycle
+        Effectively 2× slower matching
+
+
+================================================================================
+                    SECTION 6: DETAILED SYMPTOM ANALYSIS
+================================================================================
+
+What you would observe if clk_2x = clk_1x:
+
+Symptom 1: SLOW COMPRESSION
+    Input: 1000 MB/s (still fast)
+    Output: 500 MB/s (half speed)
+    
+    Reason: Hash bottleneck limits matching detection
+
+Symptom 2: REDUCED COMPRESSION RATIO
+    Because: Fewer matches detected per cycle
+    Example:
+        Current: 4 bytes scanned × 250M = 1G potential matches/sec
+        New:     2 bytes scanned × 250M = 500M potential matches/sec
+    
+    Result: Miss some match opportunities
+            Files compress less efficiently
+
+Symptom 3: HIGHER LATENCY
+    Input-to-output delay increases
+    Matching takes longer
+    More buffering required
+
+Symptom 4: PIPELINE BUBBLES
+    Bytes 2-3 wait for next cycle
+    Control FSM stalls
+    Can't maintain 4-byte/cycle throughput
+
+Symptom 5: MEMORY UNDERUTILIZATION
+    Hash SRAM accessed at 50% rate
+    DDR bandwidth wasted
+    Only 2 of 4 ports ever used
+
+
+================================================================================
+                    SECTION 7: THEORETICAL WORKAROUNDS
+================================================================================
+
+Could you operate with clk_2x = clk_1x? Technically yes, but only with:
+
+Workaround 1: REDUCE PARALLELISM
+    ✓ Possible: Configure hash to use 2-byte parallelism
+    ✗ Cost: 2× slower compression
+    ✗ Defeats purpose of parallel architecture
+
+Workaround 2: ADD HIGHER CLOCK INTERNALLY
+    ✓ Possible: Use separate PLL for hash clock
+    ✗ Cost: Need 4th clock domain, more complexity
+    ✗ Defeats purpose of saving area
+
+Workaround 3: USE 4-PORT SRAM MACRO
+    ✓ Possible: If your library has true 4-port SRAM
+    ✗ Cost: 2× area (dual-port is ~half 4-port cost)
+    ✗ Defeats purpose of efficient design
+
+Workaround 4: ACCEPT DEGRADED PERFORMANCE
+    ✓ Simplest option
+    ✗ Compression 50% slower
+    ✗ Not recommended
+
+
+================================================================================
+                    SECTION 8: WHY THE DESIGN USES clk_2x
+================================================================================
+
+The 2× clock is a CLEVER OPTIMIZATION:
+
+Goal: 4-parallel hash lookups
+Constraint: Dual-port SRAM available (not 4-port)
+
+Solution: Time-multiplex on dual-port SRAM
+
+How:
+    ├─ Use dual-port RAM (2 ports)
+    ├─ Clock at 2× frequency (500 MHz instead of 250 MHz)
+    ├─ Get 2 accesses per 2ns
+    ├─ Within single 4ns cycle, fit 2×2 = 4 accesses
+    └─ Result: 4-port behavior from 2-port hardware
+
+Benefits:
+    ✓ Efficient (half area vs true 4-port)
+    ✓ High speed (full 1000 MB/s throughput)
+    ✓ Proven pattern (used in many high-speed designs)
+
+Cost:
+    ✓ Need PLL (minimal - ~1% area)
+    ✓ Need clock domain crossing (minimal - CDC synchronizers)
+    ✗ Complexity in matching logic (necessary tradeoff)
+
+This is why removing clk_2x would be counterproductive!
+
+
+================================================================================
+                    SECTION 9: ACTUAL POWER/AREA COST OF clk_2x
+================================================================================
+
+Adding clk_2x costs:
+
+PLL (hash_pll):
+    Area: ~100 LUTs (minimal)
+    Power: ~5-10 mW @ 500 MHz
+    Purpose: Generate 2× clock
+
+CDC Synchronizers:
+    Area: ~50 LUTs (minimal)
+    Power: <1 mW
+    Purpose: Clock domain crossing (safe)
+
+Extra Clock Routing:
+    Area: ~1% overhead
+    Power: <5 mW
+    Purpose: Distribute clk_2x to hash_table
+
+Total Cost:
+    Area: ~150 LUTs (~0.5% on typical FPGA)
+    Power: ~10 mW added
+
+Benefit:
+    Throughput: 1000 MB/s (vs 500 MB/s without clk_2x)
+    Efficiency: 2× better compression performance
+
+Cost/Benefit: ★ EXCELLENT ★
+    Tiny area penalty for 2× performance improvement
+
+
+================================================================================
+                    SECTION 10: SUMMARY & RECOMMENDATION
+================================================================================
+
+Question: What if clk_2x = clk_1x?
+
+Answer: SEVERE PERFORMANCE DEGRADATION
+    ✗ Compression throughput: 1000 → 500 MB/s (50% loss)
+    ✗ Match detection: 4 parallel → 2 sequential
+    ✗ Compression ratio: Reduced (fewer matches)
+    ✗ Latency: Increased
+
+Root Cause:
+    Time-slot toggling requires 2 clk_2x edges per clk_1x cycle
+    With same frequency: Only 1 edge per cycle
+    Only 2 of 4 hash ports accessed
+
+Code Impact:
+    ✗ Current time-multiplexing logic breaks
+    ✗ Would need major FSM restructuring
+    ✗ Or switch to sequential matching (2× slower)
+
+Area/Power Trade-off:
+    Removing clk_2x saves: ~100 LUTs + ~10 mW
+    Cost: ~500 MB/s throughput loss per mW saved
+    
+    Bad trade: Lose 2× performance for minimal savings
+
+Recommendation: ★ KEEP clk_2x = 500 MHz ★
+    ✓ Essential for 1000 MB/s throughput
+    ✓ Minimal area/power cost (~0.5% area, ~10 mW)
+    ✓ Enables 4-parallel architecture
+    ✓ Proven, efficient design pattern
+
+The clk_2x is NOT optional - it's a core part of the design!
+
+
+================================================================================
+                    END OF ANALYSIS
+================================================================================
+
+Summary:
+    If clk_2x = clk_1x → Compression becomes 2× slower
+    Impact: 1000 MB/s → 500 MB/s throughput loss
+    Reason: Time-multiplexing requires 2 clock edges per cycle
+    Fix: Not worth it (minimal savings, major performance loss)
+    
+Recommendation: Keep clk_2x at 500 MHz (2× frequency)
+

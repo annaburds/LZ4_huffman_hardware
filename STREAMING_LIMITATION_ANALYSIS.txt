@@ -1,0 +1,550 @@
+================================================================================
+                    STREAMING LIMITATION ANALYSIS
+================================================================================
+
+Problem: NO INPUT SIGNAL to notify that data stream is finished
+
+Current Status: CRITICAL GAP IN STREAMING SUPPORT
+
+================================================================================
+                    SECTION 1: AVAILABLE SIGNALS AT TOP LEVEL
+================================================================================
+
+Input Signals (to lz4_top_v3):
+    ✓ clk                  - Clock (250 MHz)
+    ✓ rstN                 - Reset (active-low)
+    ✓ idata[31:0]          - Input data (4 bytes)
+    ✓ idata_req            - Input data valid/request
+    ✓ data_terminal        - END-OF-STREAM MARKER ← NOT WIRED (DEAD)
+    ✓ start_compress       - Begin compression
+    ✓ file_length[31:0]    - Total file size ← REQUIRED upfront
+    ✓ file_length_valid    - File size valid
+    ✓ out_en               - Read output (to decoder)
+
+Output Signals (from lz4_top_v3):
+    ✓ mfifo_full           - Input buffer full (backpressure)
+    ✓ mfifo_empty          - Input buffer empty
+    ✓ compress_done        - Compression finished ← OUTPUT (can't use for input)
+    ✓ out_data[33:0]       - Compressed output
+    ✓ out_valid            - Output data valid
+    ✓ out_empty            - Output exhausted
+    ✓ obuf_full            - Output buffer full
+    ✓ ohalf_full           - Output buffer half-full
+    ✓ compressed_len[31:0] - Bytes compressed (counter)
+
+
+================================================================================
+                    SECTION 2: HOW CURRENT DESIGN DETECTS EOF
+================================================================================
+
+There are THREE possible mechanisms:
+
+MECHANISM 1: file_length (PRIMARY - REQUIRED)
+    Location: control_fsm_v3.v line 1657
+    
+    Code:
+        if(file_len_cnt >= file_len_reg)
+            wait_encode = 1'b1;    // Stop processing
+        else
+            wait_encode = 1'b0;    // Continue
+    
+    Where:
+        file_len_cnt = abs_addr (current byte position)
+        file_len_reg = file_length (total size, set at startup)
+    
+    Requirement: ★ MUST provide file_length upfront ★
+    
+    Pros:
+        ✓ Deterministic (always know when to stop)
+        ✓ Allows header generation with Content Size
+        ✓ Enables exact match limiting near EOF
+    
+    Cons:
+        ✗ Cannot process unknown-length streams
+        ✗ Cannot pause and resume
+        ✗ Requires buffering or external counter
+
+
+MECHANISM 2: data_terminal (INTENDED BUT NOT IMPLEMENTED)
+    Location: lz4_top_v3.v line 28 (declared only)
+    
+    Status:
+        ✗ Declared in port list
+        ✗ NEVER connected to any internal module
+        ✗ NEVER used in control_fsm
+        ✗ NEVER used in lz4_buffer
+        ✗ DEAD CODE
+    
+    Would Have Done (if wired):
+        → Signal end-of-stream to FSM
+        → Trigger frame finalization
+        → Allow unknown-length processing
+        → Enable true continuous streaming
+    
+    Why Not Implemented:
+        Likely design oversight
+        Or intentional (file_length is more reliable)
+
+
+MECHANISM 3: Buffer fullness (UNRELIABLE)
+    Location: lz4_buffer_v2.v
+    
+    Signals:
+        fifo_empty  - Match FIFO has no entries
+        mfifo_empty - Input FIFO empty
+    
+    Could theoretically signal EOF by:
+        - Stop feeding idata (set idata_req = 0)
+        - Wait for fifo_empty = 1
+        - Then assert compress_done?
+    
+    Problem: ✗ FSM doesn't stop without file_len_cnt >= file_len_reg
+        - Without file_length set, FSM waits forever
+        - fifo_empty alone won't trigger finalization
+
+
+================================================================================
+                    SECTION 3: PRACTICAL CONSEQUENCE
+================================================================================
+
+Scenario 1: Known File Size (WORKS)
+    ┌─────────────────────────────┐
+    │ Provide file_length upfront │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ Assert start_compress = 1   │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ Feed data with idata_req    │
+    │ (can pause/resume at will)  │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ FSM compares:               │
+    │ file_len_cnt >= file_len_reg│
+    │                             │
+    │ When true → finalize        │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ compress_done pulses        │
+    │ Output available via out_*  │
+    └─────────────────────────────┘
+    
+    Status: ✓ WORKS PERFECTLY
+
+
+Scenario 2: Unknown File Size (BROKEN)
+    ┌─────────────────────────────┐
+    │ DO NOT set file_length      │
+    │ (set file_length_valid = 0) │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ Feed data continuously      │
+    │ Try to assert data_terminal │
+    │ when stream ends            │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ ✗ data_terminal is IGNORED  │
+    │ ✗ Not wired to any module   │
+    │ ✗ FSM still doesn't know    │
+    │   when to stop              │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ ✗ FSM waits forever         │
+    │ ✗ compress_done never fires │
+    │ ✗ Deadlock                  │
+    └─────────────────────────────┘
+    
+    Status: ✗ COMPLETELY BROKEN
+
+
+Scenario 3: Try to infer EOF from fifo_empty (DOESN'T WORK)
+    ┌─────────────────────────────┐
+    │ Stop feeding data           │
+    │ (set idata_req = 0)         │
+    │ Observe fifo_empty = 1      │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ External logic checks:      │
+    │ if mfifo_empty && fifo_empty│
+    │   → assume stream finished  │
+    └─────────────────────────────┘
+                    ↓
+    ┌─────────────────────────────┐
+    │ ✗ FSM still compares        │
+    │   file_len_cnt >= file_len_ │
+    │   reg                       │
+    │ ✗ If file_length = 0,       │
+    │   then immediately done     │
+    │ ✗ If file_length not set,   │
+    │   then infinite wait        │
+    └─────────────────────────────┘
+    
+    Status: ✗ UNRELIABLE
+
+
+================================================================================
+                    SECTION 4: COMPARISON WITH SPECIFICATION
+================================================================================
+
+LZ4 Frame Format Spec (RFC-8970 compliant):
+
+Standard LZ4 Frame has:
+    Magic Number (4 bytes)
+    Frame Descriptor (2+ bytes)
+        - Content Size (optional, 0-8 bytes)
+    Data Block(s)
+    Checksum (optional, 4 bytes)
+
+This design REQUIRES Content Size:
+    ✓ Content Size field is always generated
+    ✓ Set to file_length value
+    ✓ Allows decoder to pre-allocate output buffer
+    ✓ But prevents unknown-length streaming
+
+Standard says:
+    "Content Size is optional"
+    "Decompressor can work without it"
+
+This design should:
+    Allow BOTH modes:
+    ✓ With file_length → Content Size included
+    ✓ Without file_length → Content Size omitted
+    ✗ Currently: ONLY with file_length works
+
+
+================================================================================
+                    SECTION 5: WHY THIS MATTERS
+================================================================================
+
+Use Cases That FAIL Without End-of-Stream Signal:
+
+1. PIPED COMPRESSION
+   Source → Compressor → Destination
+   
+   Problem: ✗ Can't signal when source is exhausted
+   Workaround: Needed to know data size in advance
+
+2. STREAMING FROM NETWORK
+   Socket input → Compressor → Socket output
+   
+   Problem: ✗ TCP stream has unknown length
+            ✗ Must pre-calculate total bytes?
+            ✗ Or use data_terminal (not wired!)
+   Workaround: Need file_length even for streaming
+
+3. LIVE COMPRESSION (e.g., sensor data)
+   ADC → Compressor → Storage
+   
+   Problem: ✗ Data arrives continuously
+            ✗ Can't predict when to stop
+            ✗ Need external timer? Counter?
+   Workaround: Must provide chunk size as file_length
+
+4. PROGRESSIVE COMPRESSION
+   Compress → Output → Compress more
+   
+   Problem: ✗ Can't pause and resume without EOF signal
+            ✗ Must wait for compress_done
+            ✗ Need file_length for next chunk
+   Workaround: FUNCTIONAL but clunky
+
+
+Use Cases That WORK:
+
+✓ Fixed-size file compression
+  - Read entire file into SRAM
+  - Set file_length = file size
+  - Stream the bytes
+  - Works perfectly
+
+✓ Known-chunk compression
+  - Multiple 4KB chunks
+  - For each: file_length = 4096
+  - Compress chunk by chunk
+  - Works but requires pre-knowledge
+
+✓ Buffered compression
+  - Buffer data until size known
+  - Then compress with file_length
+  - Simplest approach
+  - Works but not truly streaming
+
+
+================================================================================
+                    SECTION 6: ROOT CAUSE ANALYSIS
+================================================================================
+
+Why is data_terminal dead code?
+
+Hypothesis 1: DESIGN CHOICE
+    The designer prioritized deterministic EOF detection over flexibility.
+    By requiring file_length upfront:
+        ✓ No ambiguity about stream end
+        ✓ Can generate LZ4 Content Size field
+        ✓ Can optimize match limiting near EOF
+        ✓ Simpler FSM logic
+    
+    Trade-off: Lost support for unknown-length streams
+
+
+Hypothesis 2: INCOMPLETE IMPLEMENTATION
+    The data_terminal port was declared as a placeholder,
+    but the implementation was never completed:
+        - FSM port list doesn't include it
+        - No integration testing
+        - Never used in testbench
+    
+    Evidence: Port exists in lz4_top_v3 but no connection
+
+
+Hypothesis 3: DESIGN EVOLUTION
+    Maybe earlier versions used data_terminal,
+    then design was refactored to use file_length,
+    but the old port declaration wasn't removed.
+
+
+Most Likely: Hypothesis 1 + 2
+    Intentional design (file_length is sufficient)
+    + Incomplete cleanup (dead port declaration remains)
+
+
+================================================================================
+                    SECTION 7: WHAT'S NEEDED TO FIX THIS
+================================================================================
+
+THREE CHANGES REQUIRED:
+
+CHANGE 1: Wire data_terminal to control_fsm
+    ─────────────────────────────────────────
+    File: lz4_top_v3.v
+    
+    Current (line ~130):
+        control_fsm_v3	U_control_fsm
+        (
+            .clk                (clk_1x),
+            .rstN               (rstN & pll_locked),
+            .start_compress     (start_compress),
+            .file_len           (file_length),
+            .file_len_valid     (file_length_valid),
+            ...
+        );
+    
+    Required Change:
+        Add new ports to control_fsm_v3:
+            input wire data_terminal_in,
+        
+        And wire in instantiation:
+            .data_terminal_in   (data_terminal),
+
+
+CHANGE 2: Modify control_fsm_v3 FSM
+    ──────────────────────────────────
+    File: control_fsm_v3.v
+    
+    Add input port:
+        input wire data_terminal_in,
+    
+    Modify EOF detection (line ~1657):
+        Old:
+            if(file_len_cnt >= file_len_reg)
+                wait_encode = 1'b1;
+        
+        New:
+            if((file_len_cnt >= file_len_reg) || data_terminal_in)
+                wait_encode = 1'b1;
+    
+    Alternative: If file_length not provided (file_len_reg = 0):
+        if(data_terminal_in || (file_len_valid && file_len_cnt >= file_len_reg))
+            wait_encode = 1'b1;
+
+
+CHANGE 3: Modify lz4_encoder to omit Content Size
+    ────────────────────────────────────────────
+    File: lz4_encoder_v3.v
+    
+    Current behavior: Always writes Content Size field
+    
+    Required change: If file_length_valid = 0:
+        - Clear "Content Size" bit in FLG byte
+        - Skip 4-8 byte Content Size field
+        - Decoder will not expect uncompressed size
+    
+    Implementation:
+        if (file_length_valid) begin
+            // Write Content Size field
+            out_data = file_length;
+            flg_content_size = 1'b1;
+        end else begin
+            // Omit Content Size
+            flg_content_size = 1'b0;
+        end
+
+
+RESULT AFTER FIX:
+
+Two operating modes:
+
+Mode A: Known length (current behavior)
+    file_length_valid = 1
+    file_length = N
+    data_terminal = don't care
+    → Compression stops at byte N
+    → LZ4 frame includes Content Size
+
+Mode B: Unknown length (new behavior)
+    file_length_valid = 0
+    data_terminal = 1 when stream ends
+    → Compression stops when data_terminal asserted
+    → LZ4 frame omits Content Size
+    → TRUE STREAMING SUPPORTED
+
+
+================================================================================
+                    SECTION 8: IMPACT OF MISSING SIGNAL
+================================================================================
+
+Current Limitation: ★ SEVERE ★
+
+Blocking Issues:
+    ✗ Cannot process streams of unknown length
+    ✗ Cannot implement true "streaming" compression
+    ✗ Must know data size in advance
+    ✗ data_terminal port is cosmetic (not functional)
+    ✗ No way to signal "stream finished" to hardware
+
+Workarounds (limited):
+    ✓ Pre-calculate file size → Use file_length
+    ✓ Buffer data until size known → Then compress
+    ✓ Use fixed chunk sizes → Compress chunks separately
+    ✓ External state machine → Track bytes manually
+
+Recommended Action:
+    IMPLEMENT THE FIX (Section 7)
+    
+    Why:
+        - Only 3 module changes
+        - 15-20 lines of code
+        - Enables true streaming mode
+        - Preserves backward compatibility
+        - Follows LZ4 spec for optional Content Size
+
+
+================================================================================
+                    SECTION 9: COMPARISON WITH REFERENCE LZ4
+================================================================================
+
+Reference LZ4 Implementation (zstd library):
+
+Streaming API signature:
+    LZ4_stream_t* stream = LZ4_createStream();
+    
+    while (have_data) {
+        bytes_read = read_from_source(buffer);
+        bytes_out = LZ4_compress_fast_continue(stream, buffer, ...);
+        
+        if (end_of_input)
+            break;
+    }
+    
+    flush_data();
+
+Key difference:
+    ✓ No need to know input size
+    ✓ Processes data incrementally
+    ✓ Finalize on EOF signal
+
+
+This Hardware Design:
+    ✗ Requires file_length upfront
+    ✗ Processes data with known boundaries
+    ✗ Data_terminal doesn't work
+
+
+To Match Reference:
+    Must implement the fix in Section 7
+
+
+================================================================================
+                    SECTION 10: RECOMMENDED NEXT STEPS
+================================================================================
+
+Option A: Accept Limitation (NO ACTION NEEDED)
+    Current state acceptable if:
+        ✓ Only compressing known-size files
+        ✓ Can pre-calculate data length
+        ✓ Data always available upfront
+    
+    Examples where this is OK:
+        - Video frame compression (1920×1080 = fixed)
+        - Image compression (fixed resolution)
+        - Predetermined buffer sizes
+    
+    Cost: Zero (no changes)
+    Benefit: System works as-is
+    Risk: Limits future use cases
+
+
+Option B: Implement Data_Terminal Fix (RECOMMENDED)
+    Enable both modes:
+        ✓ Known-length (legacy: file_length)
+        ✓ Unknown-length (new: data_terminal)
+    
+    Changes required:
+        - 3 files modified
+        - ~20 lines of RTL added
+        - Testbench updated
+        - ~4 hours work
+    
+    Benefit:
+        ✓ True streaming support
+        ✓ Backward compatible
+        ✓ Follows LZ4 spec
+        ✓ Enables more use cases
+    
+    Risk: Introduces new code paths (needs testing)
+
+
+Option C: Remove Dead Port (CLEANUP ONLY)
+    If not planning to implement data_terminal:
+    
+    Changes required:
+        - Remove port from lz4_top_v3.v
+        - Update documentation
+        - Update testbenches
+    
+    Benefit:
+        ✓ Cleaner interface
+        ✓ No confusion about unused signals
+    
+    Risk: None (just cleanup)
+
+
+RECOMMENDATION: Option B (Implement Data_Terminal)
+    This design deserves true streaming capability.
+    Would only be 3-4 hour investment.
+    Significant quality improvement.
+
+
+================================================================================
+                    END OF ANALYSIS
+================================================================================
+
+Summary:
+    - data_terminal is declared but NOT functional
+    - No input signal exists to notify end-of-stream
+    - Design requires file_length to be known upfront
+    - True streaming (unknown length) is NOT currently supported
+    - Fix requires wiring data_terminal and updating 3 modules
+    - Would enable both known-length and unknown-length modes
+
+Current Status: LIMITING FOR STREAMING USE CASES
+Recommendation: IMPLEMENT THE FIX
+

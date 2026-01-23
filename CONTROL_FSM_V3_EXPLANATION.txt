@@ -1,0 +1,797 @@
+================================================================================
+                    CONTROL_FSM_V3 - MASTER ORCHESTRATOR
+================================================================================
+
+File: 02.rtl/lz4/control_fsm_v3.v (1715 lines)
+Purpose: Master state machine orchestrating entire LZ4 compression pipeline
+Complexity: ★★★ CRITICAL (most complex module)
+Inputs: 50+ signals from all submodules
+Outputs: 30+ control signals to submodules
+
+
+================================================================================
+                    SECTION 1: FSM OVERVIEW
+================================================================================
+
+The control_fsm_v3 is the BRAIN of the LZ4 compressor:
+
+    Responsibilities:
+    ────────────────
+    1. Coordinate 4-parallel byte processing
+    2. Hash table operations (4-port time-multiplexed)
+    3. Match detection and verification
+    4. Match length calculation (with EOF boundary checking)
+    5. Literal collection
+    6. Encoding synchronization
+    7. File length tracking
+    8. Frame generation
+
+Data Inputs (From Submodules):
+    ├─ byte4_data[1-4]      - 4 parallel bytes from shifter
+    ├─ abs_addr[1-4]        - 4 parallel addresses
+    ├─ hash_oaddr           - Previous match address
+    ├─ hit_dist             - Distance to previous match
+    ├─ hash_ovalid          - Hash lookup result valid
+    ├─ dict_odata           - Dictionary (previous data) from buffer
+    ├─ digest               - XXHash32 checksum
+    └─ encode_done          - Encoder finished
+
+Data Outputs (To Submodules):
+    ├─ hash_idata[1-4]      - 4 bytes to hash (update)
+    ├─ hash_iaddr[1-4]      - 4 addresses to hash
+    ├─ match_offset         - Distance to match start
+    ├─ match_length         - Length of match
+    ├─ unmatch_length       - Length of literals
+    ├─ encode_en            - Enable encoder
+    └─ compress_done        - Compression finished
+
+
+================================================================================
+                    SECTION 2: 16-STATE MACHINE ARCHITECTURE
+================================================================================
+
+FSM States (16 total):
+
+    ┌─────────────────────────────────────────────────────┐
+    │                    IDLE (0x0)                       │
+    │         Waiting for start_compress = 1             │
+    └──────────────┬──────────────────────────────────────┘
+                   │
+                   ├─ (if hash_unable or fifo_count < 4)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │              WAIT_UNBUSY (0x1)                       │
+    │    Wait for hash table and FIFO to be ready         │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (when ready)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │               PROC_START (0x2)                       │
+    │     Begin processing, trigger hash table reset      │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (when hash_clean done)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │               READ_BYTES (0x3)                       │
+    │   Signal byte_addressing to provide next 4 bytes    │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (always)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │              WAIT_SVALID (0x4)                       │
+    │  Wait for shifter to provide 4 valid bytes          │
+    │                                                      │
+    │  Decision Point:                                     │
+    │  ├─ If EOF reached: → ENCODE_START                  │
+    │  └─ Else: → UPDATE_HASH                             │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (if byte4_valid)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │               UPDATE_HASH (0x5)                      │
+    │   Send 4 bytes to hash table for lookup             │
+    │   hash_idata[1-4] = byte4_data[1-4]                │
+    │   hash_ivalid[1-4] = 1                             │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (always)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │               WAIT_HASH (0x6)                        │
+    │  Wait for hash lookup result (hash_ovalid = 1)      │
+    │                                                      │
+    │  Decision Point:                                     │
+    │  ├─ If hash_hit & hit_dist < 64KB: MATCH_START     │
+    │  └─ Else: → READ_BYTES (no match)                   │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (if hash_hit)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │            MATCH_STANDBY (0x7)                       │
+    │   Align to 4-byte boundary if needed                │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (always)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │             MATCH_START (0x8)                        │
+    │   Initiate match verification                       │
+    │   Begin comparing current data with previous match  │
+    │   Set matching = 1 (enable dict reads)              │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (always)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │              MATCHING (0x9)                          │
+    │   Byte-by-byte match extension                      │
+    │   Compare current byte with dict byte               │
+    │   Increment match_length if match continues         │
+    │                                                      │
+    │   Decision Point:                                     │
+    │   ├─ If match continues & not EOF: stay MATCHING    │
+    │   ├─ If over_band (buffer full): → WAIT_FIFO       │
+    │   └─ If match ends: → MATCH_END                     │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (if over_band)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │              WAIT_FIFO (0xA)                         │
+    │   Wait for output FIFO to drain                     │
+    │   (backpressure from buffer being full)             │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (if FIFO space available)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │              MATCH_RECV (0xB)                        │
+    │   Realign to 4-byte boundary after buffer drain     │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (always)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │              MATCH_END (0xC)                         │
+    │   Match verification complete                       │
+    │   Prepare match info for encoder                    │
+    │   → ENCODE_START                                    │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (always)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │            ENCODE_START (0xD)                        │
+    │   Send match/literal info to encoder                │
+    │   Set info_valid = 1 (decoder: grab this data!)     │
+    │                                                      │
+    │   Decision Point:                                     │
+    │   ├─ If EOF: → ENCODE_WAIT                          │
+    │   └─ Else: → READ_BYTES (process more)             │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (if EOF)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │             ENCODE_WAIT (0xE)                        │
+    │   Wait for encoder to finish processing all data    │
+    │   Monitor: encode_done, encode_frame_undone         │
+    │                                                      │
+    │   Decision Point:                                     │
+    │   └─ When all data encoded: → STOP                  │
+    └──────────────┬───────────────────────────────────────┘
+                   │
+                   ├─ (when encode_done)
+                   │   ↓
+    ┌──────────────────────────────────────────────────────┐
+    │               STOP (0xF)                             │
+    │   Pulse compress_done = 1                           │
+    │   Hold in STOP state (stays here forever)           │
+    └──────────────────────────────────────────────────────┘
+
+
+================================================================================
+                    SECTION 3: KEY STATE VARIABLES
+================================================================================
+
+File Length Tracking:
+    ─────────────────
+    file_len_reg [31:0]
+        Captures file_length input on startup
+        Sets once via file_length_valid signal
+        Never changes during compression
+        Range: 0 to 4GB (32-bit)
+        Used to detect end-of-file
+    
+    file_len_cnt [31:0]
+        Assigned to: abs_addr (current position)
+        Tracks how many bytes processed
+        Range: 0 to file_len_reg
+        When file_len_cnt >= file_len_reg → EOF reached
+    
+    last_incr [31:0]
+        Calculated: file_len_reg - file_len_cnt
+        Remaining bytes to process
+        Used to limit match length near EOF
+
+
+Match Tracking:
+    ─────────────
+    hash_match [1-bit]
+        Set when hash lookup finds previous occurrence
+        Triggers entry to MATCH_START state
+    
+    match_distance_cnt [31:0]
+        Distance to previous match
+        Captured from hit_dist
+        Output as match_offset to encoder
+        Range: 0 to 65535 (limited by LZ4 format)
+    
+    match_length_cnt [31:0]
+        Accumulated match length during MATCHING state
+        Incremented by match_length_incr each cycle
+        Output to encoder
+        Starts at 4 (LZ4 minimum)
+    
+    match_addr [31:0]
+        Current position in previous occurrence
+        Used for dictionary reads (comparing bytes)
+
+
+Literal Tracking:
+    ────────────────
+    unmatch_length_cnt [31:0]
+        Accumulated literal count
+        Incremented when no match found
+        Output to encoder
+    
+    byte4_data1_reg [31:0]
+        Latched uncompressed byte
+        Used as literal data in unmatch_length encoding
+
+
+EOF Detection:
+    ─────────────
+    last_5bytes [1-bit]
+        Indicates last 5 bytes of file
+        Signals encoder to finalize
+        last_5bytes_temp is latch, updated during processing
+    
+    last_3dwords [1-bit]
+        Generated: (file_len_cnt >= file_len_reg - 13)
+        Used to limit match length near EOF
+    
+    last_1dword [1-bit]
+        Generated: (file_len_cnt >= file_len_reg - 4)
+        Indicates last 4 bytes (1 dword)
+
+
+Encoding Control:
+    ────────────────
+    encode_frame_undone [1-bit]
+        FSM has sent data to encoder
+        Encoder not yet finished
+        Prevents re-entry to ENCODE_START
+    
+    wait_encode [1-bit]
+        Set when file_len_cnt >= file_len_reg
+        FSM blocked, waiting for encoder
+    
+    wait_encode_reg [1-bit]
+        Latched version of wait_encode
+        Used in state transitions
+
+
+================================================================================
+                    SECTION 4: CRITICAL LOGIC - MATCH LENGTH LIMITING
+================================================================================
+
+Problem: How to prevent matches that extend beyond file boundary?
+
+Solution: Dynamic match length calculation based on remaining bytes
+
+Code Location: Lines 196-273 (combinational logic)
+
+The Logic:
+    ────────
+    When matching && dict_ovalid && byte4_valid:
+        Case (match_status):
+        
+        4'b1000 to 4'b1011:  // 1 byte match
+            if (file_len_cnt < file_len_reg - 5)
+                match_length_incr = 1  ← Can safely extend
+            else
+                match_length_incr = match_last_incr[2:0]  ← Limited by EOF
+                file_remand = 5  ← Padding bytes
+        
+        4'b1100 to 4'b1101:  // 2 byte match
+            if (file_len_cnt < file_len_reg - 6)
+                match_length_incr = 2  ← Can safely extend
+            else
+                match_length_incr = match_last_incr[2:0]  ← Limited
+                file_remand = 5
+        
+        4'b1110:  // 3 byte match
+            if (file_len_cnt < file_len_reg - 7)
+                match_length_incr = 3  ← Can safely extend
+            else
+                match_length_incr = match_last_incr[2:0]  ← Limited
+                file_remand = 5
+        
+        4'b1111:  // 4 byte match
+            if (file_len_cnt < file_len_reg - 8)
+                match_length_incr = 4  ← Can safely extend
+                match_goon = 1  ← Continue matching
+            else
+                match_length_incr = match_last_incr[2:0]  ← Limited
+                match_goon = 0  ← Stop extending
+                file_remand = 5
+
+Key Calculation (Line 175):
+    match_last_incr = file_len_reg - file_len_cnt - file_remand
+
+    This computes:
+        match_last_incr = Remaining Bytes - Padding Reserve
+    
+    Example:
+        file_len_reg = 100
+        file_len_cnt = 95
+        file_remand = 5
+        
+        match_last_incr = 100 - 95 - 5 = 0
+        
+        Interpretation: Only 5 bytes left, reserve 5 for padding
+                       → No more match extension allowed!
+
+
+Why the complexity?
+    ────────────────
+    LZ4 format requires:
+    ├─ Last match must fit within file boundary
+    ├─ Cannot match bytes that don't exist
+    ├─ Need to reserve bytes for padding
+    └─ Must prevent infinite loops
+
+
+================================================================================
+                    SECTION 5: HASH TABLE COORDINATION
+================================================================================
+
+The FSM orchestrates 4-parallel hash operations via time-multiplexing:
+
+UPDATE_HASH state (0x5):
+    ────────────────────
+    Outputs to hash_table:
+        hash_idata[1-4] ← byte4_data[1-4]   (4 bytes to hash)
+        hash_iaddr[1-4] ← abs_addr[1-4]     (4 addresses)
+        hash_ivalid[1-4] ← 1 (all valid)
+        hash_wr_only ← 0 (read & write)
+    
+    Action:
+        Send all 4 bytes for parallel lookup
+        Hash table uses clk_2x to handle all 4 in 1 cycle
+    
+    Next State: WAIT_HASH
+
+
+WAIT_HASH state (0x6):
+    ──────────────────
+    Monitors: hash_ovalid signal from hash_table
+    
+    When hash_ovalid = 1 (result ready):
+        Check: hash_hit && hit_dist < 64KB
+        
+        If match found:
+            Capture: match_distance_cnt ← hit_dist
+            Next: MATCH_START (begin verification)
+        
+        If no match:
+            Next: READ_BYTES (try next 4 bytes)
+    
+    This state waits 1-2 cycles for result
+
+
+MATCH_START to MATCHING (0x8 → 0x9):
+    ────────────────────────────────
+    During MATCHING:
+        If match_goon = 1 (still extending):
+            hash_wr_only ← 1 (only write, don't read)
+            hash_idata[1-4] ← new bytes for hashing
+            Send to hash table for updating
+        
+        Each cycle: advance match_addr by 4 bytes
+                   increment match_length_cnt by match_length_incr
+
+
+================================================================================
+                    SECTION 6: DATA FLOW DIAGRAM
+================================================================================
+
+Input Flow Through FSM:
+
+    idata_req=1, idata[31:0]
+           ↓ (to lz4_buffer)
+    ┌──────────────────┐
+    │  lz4_buffer      │
+    │  (64KB SRAM)     │
+    └─────────┬────────┘
+              ↓
+    byte4_data1-4 (4 parallel bytes)
+              ↓
+    ┌──────────────────────────────────────┐
+    │  byte_addressing_v4 (96-bit shifter) │
+    └──────────┬───────────────────────────┘
+               ↓
+    byte4_valid, byte4_data1-4
+               ↓
+    ┌──────────────────────────────────────┐
+    │  control_fsm_v3 (THIS MODULE)        │
+    │                                      │
+    │  WAIT_SVALID state:                 │
+    │    Receives: byte4_data1-4           │
+    │    Outputs: hash_idata1-4 to hash    │
+    │             abs_addr1-4              │
+    └──────────┬────────┬────────┬─────────┘
+               ↓        ↓        ↓
+         ┌─────────────────┐  ┌──────────────┐  ┌──────────────┐
+         │ hash_table_v3   │  │ lz4_buffer   │  │ lz4_encoder  │
+         │ (4-parallel)    │  │ (dictionary) │  │ (LZ4 format) │
+         └────────┬────────┘  └──────────────┘  └──────────────┘
+                  ↓
+    match_hit, hit_dist
+                  ↓
+    ┌──────────────────────────────────────┐
+    │  control_fsm_v3 - MATCHING state     │
+    │                                      │
+    │  Decides match_length based on       │
+    │  byte-by-byte comparison             │
+    └──────────┬───────────────────────────┘
+               ↓
+    match_offset, match_length
+    unmatch_length, unmatch_data
+               ↓
+    ┌──────────────────────────────────────┐
+    │  lz4_encoder_v3                      │
+    │  (Generates LZ4 frame)               │
+    └──────────┬───────────────────────────┘
+               ↓
+    out_data[33:0] (compressed)
+               ↓
+    External output port
+
+
+================================================================================
+                    SECTION 7: STATE TRANSITION TIMING
+================================================================================
+
+Typical Compression Cycle (per 4-byte dword):
+
+    Cycle N:    State = READ_BYTES
+                Action: Signal byte_addressing to provide next bytes
+    
+    Cycle N+1:  State = WAIT_SVALID
+                Wait for: byte4_valid = 1
+                When ready: Transition to UPDATE_HASH
+    
+    Cycle N+2:  State = UPDATE_HASH
+                Send: hash_idata[1-4] to hash module
+                Output: hash_ivalid[1-4] = 1
+    
+    Cycle N+3:  State = WAIT_HASH
+                Wait for: hash_ovalid = 1
+                Processing: Hash table working on parallel lookups
+    
+    Cycle N+4:  State = MATCH_START (if hash_hit)
+                Action: Initialize match verification
+                Set: matching = 1, match_length_cnt = 4
+    
+    Cycle N+5-10: State = MATCHING
+                Loop: Extend match while bytes match
+                Each cycle: match_length_cnt += match_length_incr
+    
+    Cycle N+11: State = MATCH_END
+                Action: Package match info
+    
+    Cycle N+12: State = ENCODE_START
+                Send: match_offset, match_length to encoder
+                Set: info_valid = 1
+    
+    Cycle N+13: State = ENCODE_WAIT or READ_BYTES (back to start)
+
+Total Latency per match: ~13-20 cycles
+
+
+================================================================================
+                    SECTION 8: CRITICAL SIGNALS EXPLAINED
+================================================================================
+
+Output Signals to Submodules:
+
+    hash_clean (output)
+        Purpose: Clear all hash table entries at start
+        Value: 1 during PROC_START
+        Effect: Hash table reset to empty state
+    
+    hash_wr_only (output)
+        Purpose: Update hash without reading
+        Value: 1 during MATCH_START/MATCHING states
+        Effect: Hash table stores visited positions
+    
+    matching (output)
+        Purpose: Enable dictionary reads
+        Value: 1 during MATCH_START/MATCHING/MATCH_RECV states
+        Effect: lz4_buffer provides previous data for comparison
+    
+    match_offset (output)
+        Purpose: Distance to previous match
+        Value: match_distance_cnt[15:0]
+        Effect: Encoded into LZ4 frame
+    
+    match_length (output)
+        Purpose: Length of match
+        Value: match_length_cnt[31:0]
+        Effect: Encoded into LZ4 frame
+    
+    unmatch_length (output)
+        Purpose: Count of uncompressed (literal) bytes
+        Value: unmatch_length_cnt[31:0]
+        Effect: Encoded into LZ4 frame
+    
+    ignore_offset (output)
+        Purpose: Signal to encoder: ignore match_offset
+        Value: 1 during last 5 bytes (no match)
+        Effect: Encoder outputs only literals
+    
+    info_valid (output)
+        Purpose: Notify encoder: match info ready
+        Value: 1 during ENCODE_START/ENCODE_WAIT
+        Effect: Encoder latches match_offset/match_length
+    
+    encode_en (output)
+        Purpose: Enable encoder to generate output
+        Value: 1 when match/literal info ready
+        Effect: Starts LZ4 frame generation
+    
+    compress_done (output)
+        Purpose: Signal compression finished
+        Value: 1 in STOP state
+        Effect: Notifies external system all data encoded
+
+
+Input Signals from Submodules:
+
+    byte4_valid (input)
+        Meaning: Shifter has 4 valid bytes ready
+        Used in: WAIT_SVALID state
+    
+    byte4_data1-4 (input)
+        Meaning: 4 parallel bytes from shifter
+        Used in: UPDATE_HASH → hash_idata routing
+    
+    hash_ovalid (input)
+        Meaning: Hash lookup result ready
+        Used in: WAIT_HASH state decision
+    
+    hash_hit (input)
+        Meaning: Previous occurrence found
+        Used in: WAIT_HASH → MATCH_START routing
+    
+    hit_dist (input)
+        Meaning: Distance to previous match
+        Used in: Captured as match_distance_cnt
+    
+    dict_ovalid (input)
+        Meaning: Dictionary data valid (previous file data)
+        Used in: MATCHING state comparison
+    
+    dict_odata (input)
+        Meaning: Byte from previous occurrence
+        Used in: Compared with byte4_data1
+    
+    encode_done (input)
+        Meaning: Encoder finished processing
+        Used in: ENCODE_WAIT state decision
+
+
+================================================================================
+                    SECTION 9: EOF HANDLING
+================================================================================
+
+How FSM Detects End-of-File:
+
+    Comparison: file_len_cnt >= file_len_reg
+                    ↓
+                   abs_addr >= file_len
+    
+    When true:
+        → last_3dwords = 1 (calculated signal)
+        → Prevents match extension
+        → Limits match length
+        → Signals EOF approaching
+
+
+Last 5 Bytes Handling:
+
+    When: file_len_cnt >= (file_len_reg - 5)
+    
+    Action:
+        Set: last_5bytes_temp = 1 (latch)
+        Then: last_5bytes = 1 (used in encoder)
+    
+    Effect:
+        Encoder outputs remaining bytes as literals
+        No more match attempts
+        Ignores match_offset
+        Finalizes frame
+
+
+State Routing on EOF:
+
+    Normal (mid-file):
+        WAIT_SVALID → UPDATE_HASH
+    
+    At EOF:
+        WAIT_SVALID → ENCODE_START (directly!)
+        Skip hash lookup when no more data
+
+
+Encoding Finalization:
+
+    When: Reach ENCODE_WAIT state at EOF
+    
+    Actions:
+        Encoder processes all pending data
+        Appends XXHash32 checksum
+        Writes LZ4 frame trailer
+        Sets encode_done = 1
+    
+    Result: compress_done = 1 (signals completion)
+
+
+================================================================================
+                    SECTION 10: PERFORMANCE CHARACTERISTICS
+================================================================================
+
+Match Detection Latency:
+    From hash lookup to match verification: 5-10 cycles
+    From match end to encoder input: 2 cycles
+    Total: 7-12 cycles per match
+
+Match Extension Rate:
+    Can extend match by 4 bytes per cycle (due to byte4_valid)
+    If match continues: 1 cycle per 4 bytes
+    
+    Example: 256-byte match takes ~64 cycles
+
+Throughput:
+    Best case: 4 bytes input per cycle
+    Limited by: Encoder output rate (typically 500MB/s)
+    Bottleneck: Hash matching when many matches found
+
+Stalling Conditions:
+    1. byte4_busy (shifter backpressure)
+    2. over_band (output buffer full)
+    3. hash_unable (hash table conflict)
+    4. encode_busy (encoder can't accept data)
+
+
+================================================================================
+                    SECTION 11: SIMPLIFIED STATE CHART
+================================================================================
+
+┌─ IDLE
+│    │ start_compress
+│    ↓
+├─ PROC_START ─┐
+│               │ hash_clean done
+│         ┌─────┴────────────────────┐
+│         ↓                          ↓
+├─ READ_BYTES ←──────┐         WAIT_UNBUSY
+│    │ (FIFO ready)  │              │
+│    ↓               │              │
+├─ WAIT_SVALID       │ (retry)      │
+│    ├─ (EOF) ─────┐ │ ←────────────┘
+│    │             ↓
+│    │        ENCODE_START ←──┐
+│    │             │          │
+│    └─┐ (not EOF) │          │
+│      ↓           ↓          │
+├─ UPDATE_HASH → ENCODE_START ─┘
+│    │              (if EOF)
+│    ↓
+├─ WAIT_HASH
+│    ├─ (no match) ──→ READ_BYTES
+│    │
+│    └─ (match found)
+│         ↓
+├─ MATCH_START
+│    ↓
+├─ MATCHING ←──┐
+│    ├─ (over_band) ──→ WAIT_FIFO → MATCH_RECV ─→┐
+│    │                                            │
+│    └─ (match ends) ──→ MATCH_END ────→────────┘
+│                           ↓
+│                     ENCODE_START
+│                           ↓
+│                     ENCODE_WAIT
+│                           ↓
+│                        STOP
+│
+└─ STOP (stays here)
+
+
+================================================================================
+                    SECTION 12: KEY INSIGHTS
+================================================================================
+
+Design Philosophy:
+
+    1. TIME-MULTIPLEXING for efficiency
+       - 4 parallel hash lookups squeezed into 2-port SRAM
+       - One byte per cycle through hash, but 4 bytes in parallel
+       
+    2. ANTICIPATORY PROCESSING
+       - Pre-calculate EOF conditions
+       - Limit match length BEFORE hitting boundary
+       - Prevent encoder from seeing invalid data
+       
+    3. PIPELINING for throughput
+       - Always feeding next request while previous result arrives
+       - Hash lookup, compare, encode all overlap
+       
+    4. STATE-BASED CONTROL
+       - Each state has specific responsibility
+       - Clean separation prevents bugs
+       - Easy to trace data flow through states
+
+Critical Design Points:
+
+    ★ File length MUST be known upfront
+      - Used in every state for boundary checking
+      - No streaming without file_length
+    
+    ★ Match length limited by EOF
+      - Lines 175-273 prevent out-of-bounds matches
+      - Calculates match_last_incr carefully
+    
+    ★ 4-parallel architecture requires complex control
+      - 4 hash lookups must be coordinated
+      - 4 addresses need calculation
+      - Results must arrive simultaneously
+    
+    ★ Backpressure handling critical
+      - WAIT_FIFO state prevents buffer overflow
+      - over_band signal triggers pause
+      - Prevents data loss
+
+
+================================================================================
+                    END OF CONTROL_FSM_V3 EXPLANATION
+================================================================================
+
+Summary:
+    control_fsm_v3 is the master orchestrator with 16 states
+    Coordinates hash lookup, matching, and encoding
+    Handles 4-parallel byte processing via time-multiplexing
+    Enforces file length boundaries throughout
+    Critical for achieving 1000 MB/s throughput
+
+Key Functions:
+    1. Manage 4-parallel hash operations
+    2. Detect and verify matches
+    3. Calculate match/literal lengths
+    4. Coordinate with encoder
+    5. Handle end-of-file conditions
+    6. Prevent buffer overflow (backpressure)
+
+Complexity: ★★★ (most complex in design)
+    1715 lines of Verilog
+    16 states with 20+ transitions
+    50+ input/output signals
+    Complex match boundary checking
+

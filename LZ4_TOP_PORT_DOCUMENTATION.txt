@@ -1,0 +1,1172 @@
+================================================================================
+                    LZ4_TOP_V3 PORT DOCUMENTATION
+================================================================================
+
+Module: lz4_top_v3.v (372 lines)
+Purpose: Top-level interface for complete LZ4 compression engine
+Location: 02.rtl/lz4/lz4_top_v3.v
+
+This document explains every input and output port of lz4_top_v3.
+
+================================================================================
+                    QUICK PORT SUMMARY TABLE
+================================================================================
+
+Category        │ Port Name          │ Dir    │ Width   │ Purpose
+────────────────┼────────────────────┼────────┼─────────┼──────────────────────
+Clocking        │ clk                │ IN     │ 1 bit   │ Main clock (250 MHz)
+                │ rstN               │ IN     │ 1 bit   │ Active-low reset
+                │
+Input Data      │ idata              │ IN     │ 32 bits │ Compressed data input
+                │ idata_req          │ IN     │ 1 bit   │ Input data valid
+                │ data_terminal      │ IN     │ 1 bit   │ Last data indicator
+                │ file_length        │ IN     │ 32 bits │ Total input size
+                │ file_length_valid  │ IN     │ 1 bit   │ File length valid
+                │
+Input Control   │ start_compress     │ IN     │ 1 bit   │ Start compression
+                │ out_en             │ IN     │ 1 bit   │ Output data read req
+                │
+Output Data     │ out_data           │ OUT    │ 34 bits │ Compressed output
+                │ out_valid          │ OUT    │ 1 bit   │ Output data valid
+                │ out_empty          │ OUT    │ 1 bit   │ Output buffer empty
+                │ compressed_len     │ OUT    │ 32 bits │ Final size
+                │
+Status Flags    │ compress_done      │ OUT    │ 1 bit   │ Compression complete
+                │ mfifo_full         │ OUT    │ 1 bit   │ Input buffer full
+                │ mfifo_empty        │ OUT    │ 1 bit   │ Input buffer empty
+                │ obuf_full          │ OUT    │ 1 bit   │ Output buffer full
+                │ ohalf_full         │ OUT    │ 1 bit   │ Output buffer half-full
+                │
+Test Interface  │ mfifo_valid        │ OUT    │ 1 bit   │ [SIM ONLY]
+                │ mfifo_data         │ OUT    │ 32 bits │ [SIM ONLY]
+
+Total: 21 ports (15 inputs, 6 outputs)
+
+
+================================================================================
+                    DETAILED PORT DESCRIPTIONS
+================================================================================
+
+════════════════════════════════════════════════════════════════════════════════
+GROUP 1: CLOCKING & RESET
+════════════════════════════════════════════════════════════════════════════════
+
+PORT: clk
+──────
+Direction:      INPUT
+Width:          1 bit
+Type:           Clock signal
+Frequency:      250 MHz (4 ns period)
+Logic:          Active-high
+
+Description:
+    Main system clock for the entire LZ4 compression engine.
+    
+Timing:
+    - All synchronous logic on posedge clk
+    - All valid signals sampled on rising edge
+    - Pipeline stages aligned to this clock
+    
+Constraints:
+    ✓ Must be stable before rstN is released
+    ✓ Must maintain 250 MHz ±10% for correct operation
+    ✓ Used for clk_1x domain (main pipeline)
+    
+Usage:
+    always @(posedge clk) begin
+        // All state updates happen here
+    end
+    
+Note: Internal PLL generates clk_2x (500 MHz) from this clock
+
+
+PORT: rstN
+──────────
+Direction:      INPUT
+Width:          1 bit
+Type:           Reset signal
+Logic:          Active-LOW (0 = reset, 1 = normal)
+Synchronous:    Asynchronous assertion, synchronous release (recommended)
+
+Description:
+    System reset. When LOW, all registers reset to initial state.
+    
+Timing:
+    Assert:   Immediately (asynchronous)
+    Release:  Should be synchronous (wait 2-3 clock cycles)
+    Duration: ≥ 10 ns recommended
+    
+Constraints:
+    ✓ Must be LOW at power-on
+    ✓ Can be asserted anytime (safe async)
+    ✓ Should not be released during clk transitions
+    ✓ Wait ≥ 500 ns after release for PLL to lock
+    
+Usage:
+    // Reset sequence in testbench:
+    rstN = 0;
+    #100;           // Hold reset for 100 ns
+    rstN = 1;
+    #500;           // Wait for PLL lock
+    start_compress = 1;
+    
+Behavior During Reset:
+    - All FIFO pointers cleared
+    - Hash table remains uncleared (separate cleanup on demand)
+    - FSM returns to IDLE state
+    - All output flags deasserted
+    - Output buffer flushed
+
+
+════════════════════════════════════════════════════════════════════════════════
+GROUP 2: INPUT DATA PATH
+════════════════════════════════════════════════════════════════════════════════
+
+PORT: idata[31:0]
+──────────────────
+Direction:      INPUT
+Width:          32 bits
+Type:           Data
+Frequency:      Up to 250 MHz (1 word per cycle max)
+Byte Order:     Big-endian [31:24] = Byte0, [23:16] = Byte1, etc.
+
+Description:
+    Input compressed data stream (4 bytes = 1 dword per cycle).
+    
+Timing Relationship:
+    Sampled:    On posedge clk when idata_req=1
+    Setup time: ≥ tco (typically 0-2 ns)
+    Hold time:  ≥ 0 ns (registered on clk edge)
+    
+Valid Values:
+    - Any 32-bit value (0x00000000 - 0xFFFFFFFF)
+    - Padding bytes after data_terminal can be any value
+    
+Constraints:
+    ✓ Only used when idata_req = 1
+    ✓ Can change on every cycle
+    ✓ Must be stable ≥ tco before clk edge
+    
+Usage Example:
+    // Sequential feed
+    idata = 32'h12345678;
+    idata_req = 1;
+    #4;  // Wait 1 clock cycle (at 250 MHz)
+    idata = 32'h9ABCDEF0;
+    #4;
+    // Next dword feeds on next clock edge
+    
+Pipeline Delay:
+    - Cycle N: idata appears on input
+    - Cycle N+1: Processed by byte_addressing
+    - Cycle N+2: Shifted outputs available
+    - Cycle N+7: Final match results ready (7-cycle latency)
+
+
+PORT: idata_req
+───────────────
+Direction:      INPUT
+Width:          1 bit
+Type:           Handshake signal (data valid)
+Logic:          Active-HIGH (1 = data ready, 0 = no data)
+Synchronous:    Yes (sampled on posedge clk)
+
+Description:
+    Indicates that idata[31:0] contains valid data to process.
+    
+Handshake Protocol:
+    When idata_req = 1:
+        → idata is valid
+        → lz4_top will consume it on posedge clk
+        → Sender can change idata in next cycle
+    
+    When idata_req = 0:
+        → idata is ignored (don't care)
+        → No data consumed
+        → Can hold current idata or update for next cycle
+    
+Throughput:
+    Maximum:    1 dword per cycle (250 MB/s @ 250MHz)
+    Minimum:    Can be 0 dwords per cycle (stall)
+    Average:    Depends on producer side
+    
+Constraints:
+    ✓ Can assert/deassert every cycle
+    ✓ Can stall indefinitely (no deadlock)
+    ✓ Should be stable 0 ns before clk edge
+    
+Usage Example:
+    // Burst mode (continuous)
+    for (int i = 0; i < file_size/4; i++) begin
+        idata = data[i];
+        idata_req = 1;
+        #4;
+    end
+    
+    // Bursty mode (intermittent)
+    idata_req = 1;
+    #4;
+    idata_req = 0;  // Stall for 1 cycle
+    #4;
+    idata_req = 1;  // Resume
+    #4;
+
+
+PORT: data_terminal
+────────────────────
+Direction:      INPUT
+Width:          1 bit
+Type:           Control signal (DEAD PORT - NOT WIRED)
+Logic:          Active-HIGH (1 = last data, 0 = more data coming)
+Synchronous:    Yes (sampled on posedge clk)
+
+⚠️  CRITICAL: This port is DECLARED but NEVER CONNECTED internally.
+    It has NO EFFECT on the compression process.
+
+Current Status:
+    ✗ Declared in lz4_top_v3.v port list (line 28)
+    ✗ Never instantiated to any submodule
+    ✗ Not received by control_fsm_v3
+    ✗ Not received by lz4_buffer_v2
+    ✗ Entirely ignored by the hardware
+
+Intended Purpose (if implemented):
+    Would indicate that idata contains the LAST 4 bytes of input file.
+    Would trigger final processing and compression finalization.
+
+Current Workaround:
+    The design uses file_length instead:
+    - Must provide file_length upfront
+    - Compression stops when file_len_cnt >= file_len_reg
+    - File length determines frame finalization
+
+To Enable data_terminal (Future Work):
+    See LZ4_DATA_FLOW_EXAMPLE.txt Section 10 for implementation steps.
+    Would require:
+    1. Wire to control_fsm input
+    2. Add terminal signal to lz4_buffer
+    3. Modify xxh32_calc to finalize on data_terminal
+    4. Make file_length optional in LZ4 frame header
+    
+Usage Example:
+    // Normal file with known size
+    for (int i = 0; i < file_size/4; i++) begin
+        idata = data[i];
+        idata_req = 1;
+        if (i == file_size/4 - 1)
+            data_terminal = 1;  // Last block
+        else
+            data_terminal = 0;
+        #4;
+    end
+    data_terminal = 0;  // Deassert after final block
+    
+    // Streaming with unknown size
+    do begin
+        read_4bytes(idata);
+        idata_req = 1;
+        if (eof) data_terminal = 1;
+        #4;
+    end while (idata_req == 1);
+
+
+PORT: file_length[31:0]
+────────────────────────
+Direction:      INPUT
+Width:          32 bits
+Type:           Data (size in bytes)
+Range:          0 - 0xFFFFFFFF bytes (4 GB max)
+Units:          Bytes (not dwords)
+
+Description:
+    Total size of input file/stream to be compressed.
+    Used for optimization and frame header generation.
+    
+Timing:
+    Set:        Before start_compress assertion
+    Valid:      Must be stable when file_length_valid = 1
+    Used:       Once at compression start
+    
+Relationship to data_terminal:
+    - file_length: Total size of input
+    - data_terminal: Signal marking last physical dword
+    - May not align exactly (if file_length % 4 != 0)
+    
+Constraints:
+    ✓ Should be accurate (within 3 bytes)
+    ✓ If inaccurate, file_length_valid should be 0
+    ✓ Can be 0 if size is unknown (may reduce efficiency)
+    
+Example Usage:
+    // Known file size
+    file_length = 32'h00001000;  // 4096 bytes
+    file_length_valid = 1;
+    start_compress = 1;
+    #4;
+    start_compress = 0;
+    
+    // Unknown file size
+    file_length = 32'h00000000;
+    file_length_valid = 0;  // Indicate size unknown
+    start_compress = 1;
+
+
+PORT: file_length_valid
+────────────────────────
+Direction:      INPUT
+Width:          1 bit
+Type:           Control/enable flag
+Logic:          Active-HIGH (1 = length valid, 0 = unknown)
+Synchronous:    Yes (sampled with start_compress)
+
+Description:
+    Indicates that file_length[31:0] is accurate and should be used.
+    
+Timing:
+    Assert:     When file_length is ready
+    Release:    After start_compress cycle
+    Must be:    Stable during compression start
+    
+Behavior:
+    When HIGH:
+        - file_length is trusted
+        - Used in LZ4 frame header (if feature enabled)
+        - Enables optimization (e.g., small-file handling)
+        - Improves compression efficiency
+    
+    When LOW:
+        - file_length[31:0] is ignored (don't care)
+        - Size is determined by data_terminal signal
+        - May reduce optimization opportunities
+        - Still produces valid compressed output
+    
+Constraints:
+    ✓ Should be asserted when file_length is ready
+    ✓ Can be LOW for streaming scenarios
+    ✓ Value before start_compress is captured
+    
+Usage Example:
+    // Known size (typical)
+    file_length = file_size;
+    file_length_valid = 1;
+    start_compress = 1;
+    #4;
+    
+    // Streaming/unknown size
+    file_length = 0;
+    file_length_valid = 0;  // Don't use file_length
+    start_compress = 1;     // Size determined by data_terminal
+
+
+════════════════════════════════════════════════════════════════════════════════
+GROUP 3: INPUT CONTROL
+════════════════════════════════════════════════════════════════════════════════
+
+PORT: start_compress
+──────────────────────
+Direction:      INPUT
+Width:          1 bit
+Type:           Control signal / pulse
+Logic:          Active-HIGH (1 = start, 0 = idle)
+Synchronous:    Yes (sampled on posedge clk)
+
+Description:
+    Starts a new compression job. Pulse this signal HIGH for 1 cycle
+    to initiate compression.
+    
+Timing:
+    Assert:     1 cycle
+    Release:    Deassert after (returns LOW)
+    Duration:   ≥ 1 clock cycle
+    Minimum separation: ≥ compress_done + 100 cycles
+    
+Behavior on start_compress = 1:
+    1. FSM transitions from IDLE to compression start
+    2. Input FIFO begins accepting data (idata_req)
+    3. Hash table initialized (cleared)
+    4. Pipeline begins processing
+    5. First output ready in ~7-10 cycles
+    
+Constraints:
+    ✓ Must be preceded by reset (rstN=1)
+    ✓ Must wait until previous job finishes (compress_done)
+    ✓ Can only start one job at a time
+    ✓ Should pulse for exactly 1 cycle (best practice)
+    
+Usage Pattern:
+    // Compression sequence
+    rstN = 1;
+    #500;
+    
+    start_compress = 1;
+    #4;  // Pulse for 1 cycle
+    start_compress = 0;
+    
+    // Feed data
+    for (int i = 0; i < file_size/4; i++) begin
+        idata = data[i];
+        idata_req = 1;
+        if (i == file_size/4 - 1)
+            data_terminal = 1;
+        #4;
+    end
+    
+    // Wait for completion
+    wait (compress_done);
+
+
+PORT: out_en
+─────────────
+Direction:      INPUT
+Width:          1 bit
+Type:           Handshake signal (output read enable)
+Logic:          Active-HIGH (1 = read data, 0 = hold)
+Synchronous:    Yes (sampled on posedge clk)
+
+Description:
+    Signals that receiver is ready to consume compressed output data.
+    Implements flow control for output FIFO.
+    
+Handshake Protocol:
+    When out_en = 1:
+        → Receiver is ready for next word
+        → If out_valid = 1, out_data is captured
+        → Output FIFO pointer advances
+        → New data appears on out_data next cycle
+    
+    When out_en = 0:
+        → out_data is held (stalled)
+        → FIFO pointer does not advance
+        → Data retained in FIFO
+        → No backpressure to compression engine
+    
+Flow Control Semantics:
+    out_valid=1 + out_en=1  → Transfer occurs
+    out_valid=1 + out_en=0  → Stall (receiver not ready)
+    out_valid=0 + out_en=0  → FIFO empty (no valid data)
+    out_valid=0 + out_en=1  → Protocol error (shouldn't occur)
+    
+Throughput Impact:
+    - out_en continuous HIGH: ~1 word/cycle (max 34 bits/cycle)
+    - out_en periodic: Reduced throughput (backpressure)
+    - out_en LOW for extended time: FIFO may fill (obuf_full)
+    
+Constraints:
+    ✓ Can assert/deassert every cycle
+    ✓ Can apply backpressure indefinitely (no deadlock)
+    ✓ When out_valid=1 and out_en=1, data is transferred
+    
+Usage Example:
+    // Continuous read (no backpressure)
+    out_en = 1;
+    while (!out_empty) begin
+        @(posedge clk);
+        if (out_valid)
+            output_buffer[write_ptr++] = out_data;
+    end
+    
+    // Gated read (external flow control)
+    while (compression_active) begin
+        @(posedge clk);
+        if (external_buffer_ready)
+            out_en = 1;
+        else
+            out_en = 0;
+    end
+
+
+════════════════════════════════════════════════════════════════════════════════
+GROUP 4: OUTPUT DATA PATH
+════════════════════════════════════════════════════════════════════════════════
+
+PORT: out_data[33:0]
+──────────────────────
+Direction:      OUTPUT
+Width:          34 bits
+Type:           Data (compressed output)
+Update:         On posedge clk
+Valid:          When out_valid = 1
+
+Description:
+    Compressed output data stream in LZ4 frame format.
+    Width is 34 bits (wider than idata to accommodate metadata).
+    
+Data Format:
+    Bits [33:32]:   Tag/Type indicator (2 bits)
+                    00 = Data byte (literal)
+                    01 = Match token
+                    10 = Length encoding
+                    11 = Padding/End marker
+    Bits [31:0]:    32-bit payload data
+    
+Output Content:
+    - LZ4 frame header (magic number, flags, etc.)
+    - Literal sections
+    - Match tokens (offset, length pairs)
+    - Optional XXHash32 checksum trailer
+    - Frame end marker
+    
+Timing:
+    Valid during:   out_valid = 1
+    Stable for:     ≥ tco from posedge clk
+    Latched by:     out_en AND out_valid
+    
+Usage Constraints:
+    ✓ Only valid when out_valid = 1
+    ✓ Should be latched only when out_en = 1
+    ✓ Can change every cycle
+    ✓ Changes synchronously with clk
+    
+Pipeline Delay:
+    - Cycle N: out_valid goes HIGH
+    - Cycle N: out_data contains first output word
+    - Latency from compression start: ~10 cycles minimum
+    
+Parsing:
+    Software must parse out_data stream according to LZ4 spec:
+    - Read frame header
+    - Interpret tokens
+    - Reconstruct literals and matches
+    - Verify checksum
+    
+Example Consumer:
+    always @(posedge clk) begin
+        if (out_valid && out_en) begin
+            if (out_data[33:32] == 2'b00)
+                // Literal byte
+                write_byte(out_data[7:0]);
+            else if (out_data[33:32] == 2'b01)
+                // Match token: apply match at given offset
+                apply_match(out_data);
+        end
+    end
+
+
+PORT: out_valid
+────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Handshake signal
+Logic:          Active-HIGH (1 = data valid, 0 = no data)
+Synchronous:    Yes (updated on posedge clk)
+
+Description:
+    Indicates that out_data[33:0] contains valid compressed output.
+    Part of standard handshake protocol with out_en.
+    
+Timing:
+    Goes HIGH:      When compressed data is ready to output
+    Stays HIGH:     While data in FIFO exists
+    Goes LOW:       When FIFO becomes empty
+    
+Handshake Semantics:
+    out_valid=1:    out_data is valid (can be read if out_en=1)
+    out_valid=0:    out_data is invalid (FIFO empty, don't read)
+    
+Data Flow:
+    Cycle N:   out_valid=1, out_en=1  → Data transferred
+    Cycle N+1: out_valid depends on more data in FIFO
+    
+Propagation Delay:
+    Depends on:
+    - Compression algorithm progress
+    - FIFO occupancy
+    - Match occurrence rate
+    
+Typical Behavior:
+    - Initially LOW (FIFO empty)
+    - Goes HIGH after ~7 cycles (pipeline delay)
+    - Toggles based on FIFO occupancy and out_en
+    - Goes LOW when all data processed and FIFO empty
+    
+Usage Pattern:
+    wait (out_valid);  // Wait for first output
+    while (!out_empty) begin
+        if (out_valid && out_en) begin
+            output = out_data;
+            write_output(output);
+        end
+        @(posedge clk);
+    end
+
+
+PORT: out_empty
+────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Status flag
+Logic:          Active-HIGH (1 = empty, 0 = has data)
+Synchronous:    Combinatorial (updated immediately)
+
+Description:
+    Indicates that output FIFO is completely empty.
+    Can be used for end-of-compression detection.
+    
+Behavior:
+    out_empty=1:    FIFO contains no data
+                    out_data is invalid
+                    Receive side should not read
+    
+    out_empty=0:    FIFO contains ≥1 word
+                    out_data is valid (may still need out_valid check)
+                    Can read if out_en=1
+    
+Timing:
+    Updates:        Combinatorial (no clock delay)
+    Changes on:     FIFO pointer updates (posedge clk)
+    Propagates:     ~tco after clk edge
+    
+Usage for Completion Detection:
+    // Detect when all output is consumed
+    task wait_for_output_done;
+        wait (out_empty && !out_valid);
+        // All compressed data has been read
+    endtask
+    
+Distinction from out_valid:
+    out_empty:      Combinatorial (reflects current FIFO state)
+    out_valid:      Synchronous (valid flag from FIFO)
+    
+    Use out_empty for status checks
+    Use out_valid for handshake
+
+
+PORT: compressed_len[31:0]
+───────────────────────────
+Direction:      OUTPUT
+Width:          32 bits
+Type:           Status (size in bytes)
+Units:          Bytes
+Update:         On compress_done pulse
+
+Description:
+    Final compressed file size in bytes (after all output consumed).
+    Updated when compression finishes (compress_done=1).
+    
+Timing:
+    Valid after:    compress_done assertion
+    Stable until:   Next start_compress
+    Updated on:     posedge clk when compress_done
+    Latency:        Available immediately after compress_done
+    
+Value:
+    Range:          0 to 0xFFFFFFFF bytes
+    Typical:        20-70% of input size (depending on data)
+    Format:         Big-endian (same as input)
+    
+Calculation:
+    compressed_len = Sum of all out_data transmitted
+                    (includes LZ4 frame header/footer)
+    
+Usage for Compression Ratio:
+    ratio = (input_size - compressed_len) * 100 / input_size
+    
+    Example:
+        input_size = 1024 bytes
+        compressed_len = 256 bytes
+        ratio = (1024 - 256) * 100 / 1024 = 75% compression
+    
+Reliability:
+    ✓ Accurate (reflects actual output)
+    ✓ Available immediately upon completion
+    ✓ Can be used for statistics/logging
+    ✓ Updated each compression cycle
+    
+Usage Example:
+    wait (compress_done);
+    $display("Compressed %d bytes to %d bytes (ratio: %f%%)",
+             input_size, compressed_len,
+             (input_size - compressed_len)*100.0/input_size);
+
+
+════════════════════════════════════════════════════════════════════════════════
+GROUP 5: STATUS FLAGS
+════════════════════════════════════════════════════════════════════════════════
+
+PORT: compress_done
+─────────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Completion flag / Pulse
+Logic:          Active-HIGH (1 = compression complete)
+Synchronous:    Yes (pulsed on posedge clk)
+
+Description:
+    Pulses HIGH for 1 cycle when compression finishes.
+    Indicates entire file has been processed and all output generated.
+    
+Timing:
+    Pulse Duration: Exactly 1 clock cycle
+    Appears After:  All compressed data is ready (not necessarily output)
+    Latency:        ~10-1000 cycles after data_terminal
+    
+What compress_done Means:
+    ✓ All input has been processed
+    ✓ All hash lookups complete
+    ✓ All matches resolved
+    ✓ All encoder output FIFO populated
+    ✗ Does NOT mean output has been read (could still be in FIFO)
+    
+Behavior:
+    Before:      compress_done = 0 (normal operation)
+    During:      compress_done = 1 (exactly 1 cycle)
+    After:       compress_done = 0 (unless another job completes)
+    
+Synchronization:
+    Synchronized:   With input clk (posedge clk)
+    CAN pulse:      Every cycle (if multiple jobs complete)
+    Should NOT:     Occur during active compression
+    
+Usage for Job Control:
+    // Wait for compression to finish
+    wait (compress_done);
+    
+    // Read compressed_len after completion
+    bytes_compressed = compressed_len;
+    
+    // Start next job
+    start_compress = 1;
+    #4;
+    start_compress = 0;
+    
+Detection Constraints:
+    ✓ Pulse is 1 cycle (may miss if not actively monitored)
+    ✓ Cannot have multiple simultaneous compressions
+    ✓ Must be followed by out_empty to ensure all data read
+    
+Typical Sequence:
+    Cycle N:    compress_done pulses HIGH
+    Cycle N+1:  compress_done returns LOW (automatic)
+    Cycle N+1+: Can read compressed_len
+    Cycle N+2+: Can start next compression job
+
+
+PORT: mfifo_full
+──────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Status flag
+Logic:          Active-HIGH (1 = full, 0 = space available)
+Synchronous:    Combinatorial
+
+Description:
+    Indicates that input buffer (match FIFO) is completely full.
+    Cannot accept more input data when HIGH.
+    Implements backpressure from compression pipeline.
+    
+Capacity:
+    Maximum entries:    512 × 4 bytes = 2048 bytes (2KB)
+    When to stop feed:  mfifo_full goes HIGH
+    Can assert:         Every cycle independently
+    
+Behavior:
+    mfifo_full=1:   Input buffer is at maximum capacity
+                    Sending more idata_req would cause overflow
+                    Producer should STOP feeding data
+                    Already-loaded data continues processing
+    
+    mfifo_full=0:   Input buffer has space
+                    Can accept ≥1 more dword
+                    Safe to assert idata_req
+    
+Timing:
+    Updates:        Combinatorial (instantaneous)
+    Causes:         Slow processing or fast input
+    Recovery:       When compression catches up
+    
+Flow Control:
+    Recommended protocol:
+        if (mfifo_full)
+            idata_req = 0;  // Stop feeding
+        else if (have_more_data)
+            idata_req = 1;  // Resume feeding
+    
+Performance Impact:
+    - mfifo_full frequent: Bottleneck in compression
+    - mfifo_full rare: Input dominated (good performance)
+    - Optimizations: Tune buffer sizes for target system
+
+
+PORT: mfifo_empty
+───────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Status flag
+Logic:          Active-HIGH (1 = empty, 0 = has data)
+Synchronous:    Combinatorial
+
+Description:
+    Indicates that input buffer is completely empty.
+    Can feed more data when HIGH, or stop if file complete.
+    
+Behavior:
+    mfifo_empty=1:  No data in input buffer
+                    All data consumed by compression
+                    Safe to stop feeding
+                    Output still being generated from pipeline
+    
+    mfifo_empty=0:  Input buffer has ≥1 dword
+                    Data in pipeline being processed
+                    Output generation likely underway
+    
+Timing:
+    Updates:        Combinatorial
+    Response:       Immediate to input changes
+    
+Usage:
+    // Useful for stream control
+    if (mfifo_empty && !more_data_coming)
+        can_begin_finalization = 1;
+    
+Note:
+    mfifo_empty does NOT mean compression is complete!
+    Data can still be in pipeline and output FIFO.
+    Use compress_done + out_empty for full completion.
+
+
+PORT: obuf_full
+─────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Status flag
+Logic:          Active-HIGH (1 = full, 0 = space available)
+Synchronous:    Combinatorial
+
+Description:
+    Indicates that output FIFO is completely full.
+    No more compressed output can be buffered.
+    Implements backpressure if receiver is slow.
+    
+Capacity:
+    Maximum:        Output FIFO depth
+    Typical:        4-16 words (136-544 bits)
+    When:           obuf_full goes HIGH if out_en is LOW too long
+    
+Behavior:
+    obuf_full=1:    Compression engine must pause
+                    Cannot generate more output words
+                    Waiting for consumer to read (out_en=1)
+                    Pipeline stalls (no backpressure to input)
+    
+    obuf_full=0:    Output FIFO has space
+                    Compression can continue
+                    More output words can be generated
+    
+Impact on Compression:
+    - Rare (only if output stalled)
+    - When occurs: Compression throughput limited by output rate
+    - Resolution: Increase out_en frequency
+    
+Difference from obuf_half_full:
+    obuf_full:      FIFO completely full (100%)
+    obuf_half_full: FIFO at 50% capacity
+    
+    Use for:
+    - obuf_full: Hard stop (must read)
+    - obuf_half_full: Early warning (may want to read)
+
+
+PORT: ohalf_full
+──────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Status flag
+Logic:          Active-HIGH (1 = half or more full, 0 = <50%)
+Synchronous:    Combinatorial
+
+Description:
+    Early warning that output FIFO is approaching capacity.
+    Indicates FIFO occupancy is ≥ 50%.
+    Allows consumer to prepare for potential stall.
+    
+Thresholds:
+    ohalf_full=0:   FIFO <50% full
+                    Compression proceeding normally
+    
+    ohalf_full=1:   FIFO ≥50% full
+                    Output should be read to prevent overflow
+                    consumer_rate < compression_rate
+    
+Usage:
+    // Predictive flow control
+    if (ohalf_full)
+        priority = HIGH;  // Start reading output soon
+    if (obuf_full)
+        priority = URGENT; // Read immediately
+    
+Typical Behavior:
+    - Often HIGH (compression faster than typical output)
+    - Brief to LOW when output consumed
+    - Back to HIGH quickly (compression continues)
+    
+Performance Monitoring:
+    High frequency toggling:    Balanced I/O rates
+    Stuck HIGH:                 Output consumer too slow
+    Stuck LOW:                  Compression very fast
+
+
+════════════════════════════════════════════════════════════════════════════════
+GROUP 6: TEST/SIMULATION ONLY PORTS
+════════════════════════════════════════════════════════════════════════════════
+
+PORT: mfifo_valid [TEST ONLY]
+──────────────────────────────
+Direction:      OUTPUT
+Width:          1 bit
+Type:           Test signal
+Logic:          Active-HIGH
+Synchronous:    Yes (updated on posedge clk)
+
+Description:
+    **FOR SIMULATION/TESTBENCH USE ONLY**
+    Internal debug signal showing match FIFO output validity.
+    NOT intended for hardware integration.
+    
+Purpose:
+    Allows testbench to monitor internal match FIFO without
+    affecting normal compression operation.
+    Helps verify correct matches are being generated.
+    
+Behavior:
+    mfifo_valid=1:  Match FIFO has valid data
+                    mfifo_data contains match information
+    
+    mfifo_valid=0:  No valid data in match FIFO
+    
+Timing:
+    Synchronous (updates on clock edge)
+    Reflects FIFO output state
+    
+DO NOT USE IN PRODUCTION:
+    ✗ Not part of standard interface
+    ✗ May be removed in future versions
+    ✗ Performance implications if used in RTL
+    ✗ No timing guarantees
+
+
+PORT: mfifo_data[31:0] [TEST ONLY]
+────────────────────────────────────
+Direction:      OUTPUT
+Width:          32 bits
+Type:           Test/debug data
+Synchronous:    Yes (updated on posedge clk)
+
+Description:
+    **FOR SIMULATION/TESTBENCH USE ONLY**
+    Internal match FIFO output data for test purposes.
+    Shows match information being fed to encoder.
+    
+Format (when mfifo_valid=1):
+    [31:16]:  Match offset from current position
+    [15:0]:   Match length in bytes
+    
+Purpose:
+    Allows testbench to:
+    - Verify correct matches detected
+    - Debug compression algorithm
+    - Monitor match statistics
+    - Compare with reference software
+    
+Example Usage in Testbench:
+    @(posedge clk);
+    if (mfifo_valid) begin
+        offset = mfifo_data[31:16];
+        length = mfifo_data[15:0];
+        $display("Match: offset=%d, length=%d", offset, length);
+    end
+    
+DO NOT USE IN PRODUCTION:
+    ✗ Not part of hardware interface
+    ✗ For simulation debugging only
+    ✗ May change or disappear
+    ✗ No SLA on accuracy
+
+
+════════════════════════════════════════════════════════════════════════════════
+                    PORT TIMING DIAGRAM
+════════════════════════════════════════════════════════════════════════════════
+
+Compression Startup Sequence:
+────────────────────────────
+
+    clk      ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐
+             └─┘ └─┘ └─┘ └─┘ └─┘ └─┘ └─┘ └─┘ └─┘
+
+    rstN     ______┐─────────────────────────────────
+             (LOW)  (RELEASED)
+
+    file_length_valid
+             _____________┐───────────────────────
+                         (1 CYCLE)
+
+    start_compress
+             _________________________┐───────────
+                                     (1 CYCLE PULSE)
+
+    idata_req
+             _________________________________┐───┐───
+                                             (READY)
+
+    mfifo_empty
+             ────────────────────────┐─ (becomes 0)
+                                    (latency ~5 cycles)
+
+    out_valid
+             ───────────────────────────┐────── (first data)
+                                       (latency ~7 cycles)
+
+    compress_done
+             (stays LOW until compression ends)
+             ────────────────────────────────────────┐───
+                                                    (1 CYCLE PULSE)
+
+
+Data Transfer Sequence:
+───────────────────────
+
+    clk      ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐
+             └─┘ └─┘ └─┘ └─┘ └─┘ └─┘ └─┘
+
+    out_valid
+             ─────┐───────────────┐───────────
+                 (HIGH when data ready)
+
+    out_en   ┌─┐ ┌─┐ ┌─┐ ┌───────┐ ┌─┐
+             └─┘ └─┘ └─┘ └───────┘ └─┘
+                (receiver stalls)
+
+    out_data [D0] [D1] [D2] [D2 held] [D3]
+             (changes on clock edges)
+
+    out_empty
+             ─────────────────┐────────────
+                            (LOW while has data)
+
+    Transfer Window:
+    out_valid AND out_en: Data moves to receiver
+    out_valid AND NOT out_en: Data stalls (held in FIFO)
+
+
+════════════════════════════════════════════════════════════════════════════════
+                    USAGE GUIDELINES
+════════════════════════════════════════════════════════════════════════════════
+
+RECOMMENDED INPUT SEQUENCE:
+──────────────────────────
+
+1. Power-on & Reset
+    rstN <= 0;
+    #100;
+    rstN <= 1;
+    #500;  // Wait for PLL lock
+
+2. Setup File Parameters
+    file_length <= file_size;
+    file_length_valid <= 1;
+
+3. Start Compression
+    start_compress <= 1;
+    #4;
+    start_compress <= 0;
+
+4. Feed Data
+    while (data_available) begin
+        idata <= next_dword;
+        idata_req <= 1;
+        if (last_data)
+            data_terminal <= 1;
+        #4;
+    end
+    idata_req <= 0;
+
+5. Wait for Completion
+    wait (compress_done);
+    bytes = compressed_len;
+
+
+RECOMMENDED OUTPUT SEQUENCE:
+───────────────────────────
+
+1. Wait for Data Ready
+    wait (out_valid);
+
+2. Read Output Loop
+    while (!out_empty) begin
+        @(posedge clk);
+        out_en <= 1;
+        if (out_valid) begin
+            write_output(out_data);
+        end
+    end
+
+3. Verify Completion
+    wait (!out_valid && out_empty);
+    // All compressed data read
+
+
+PERFORMANCE OPTIMIZATION:
+────────────────────────
+
+Input Side:
+    ✓ Keep idata_req=1 for continuous data (if possible)
+    ✓ Avoid stalling (idata_req=0) unless necessary
+    ✓ Respect mfifo_full backpressure
+
+Output Side:
+    ✓ Keep out_en=1 when buffer ready (don't stall)
+    ✓ React quickly to out_valid (low-latency path)
+    ✓ Use ohalf_full for predictive management
+
+
+ERROR HANDLING:
+──────────────
+
+Timeout Detection:
+    // Detect stalled compression
+    timeout = 0;
+    while (!compress_done) begin
+        #1000;
+        timeout++;
+        if (timeout > 1000)
+            $error("Compression timeout!");
+    end
+
+Underflow Detection:
+    // Detect output underflow
+    if (!out_valid && out_en && !out_empty)
+        $warning("Output FIFO protocol error");
+
+Overflow Detection:
+    // Stop feeding if input full
+    if (mfifo_full)
+        idata_req = 0;
+
+
+════════════════════════════════════════════════════════════════════════════════
+                    SUMMARY TABLE
+════════════════════════════════════════════════════════════════════════════════
+
+Port                  Typical Use              Signal Type       Critical
+──────────────────────────────────────────────────────────────────────────────
+clk                   Timing reference         Clock             ★★★
+rstN                  System reset             Control           ★★★
+idata                 Input stream             Data              ★★★
+idata_req             Input handshake          Flow control      ★★★
+start_compress        Job trigger              Pulse             ★★★
+out_en                Output flow control      Handshake         ★★★
+out_data              Compressed stream        Data              ★★★
+out_valid             Output handshake         Flow control      ★★★
+compress_done         Completion indicator     Pulse             ★★
+file_length           Input size hint          Status            ★
+out_empty             Buffer empty flag        Status            ★★
+mfifo_full            Input backpressure       Status            ★★
+obuf_full             Output full flag         Status            ★
+compressed_len        Output size              Data              ★★
+(Others)              Configuration/Debug      Test only         —
+
+★★★ = Critical (must use)
+★★  = Important (should use)
+★   = Optional (nice to have)
+
+
+================================================================================

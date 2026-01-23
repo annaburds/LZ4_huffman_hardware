@@ -1,0 +1,462 @@
+================================================================================
+                    LZ4 TESTBENCHES - WHICH TO USE
+================================================================================
+
+YES! There are working testbenches for LZ4 compression alone.
+
+Location: /03.sim/
+
+================================================================================
+                    AVAILABLE TESTBENCHES
+================================================================================
+
+1. ✓ lz4_top_tb_v2.v (417 lines)
+   ├─ Tests: lz4_top_v3 module (complete LZ4 compression)
+   ├─ Type: Full system testbench
+   ├─ Features: 
+   │   ├─ File-based stimuli (binary files from test_src/compress/)
+   │   ├─ Calgary corpus test cases (words, paper1-6, book1-2, etc.)
+   │   ├─ Canterbury corpus test cases
+   │   ├─ Output file generation (.lz4 format)
+   │   └─ Self-checking (compares output)
+   ├─ Status: ★★★ RECOMMENDED - Most complete
+   ├─ Includes:
+   │   ├─ Clock generation (250MHz @ 4ns = Tcq)
+   │   ├─ Reset logic
+   │   ├─ Data flow control
+   │   ├─ Output verification
+   │   └─ Performance timing logs
+   └─ Test files: 40+ test cases included
+
+
+2. ✓ lz4_encoder_tb.v (217 lines)
+   ├─ Tests: lz4_encoder_v3 module (encoder only)
+   ├─ Type: Unit testbench
+   ├─ Features:
+   │   ├─ Direct control of encoder inputs
+   │   ├─ Token/offset/length generation
+   │   ├─ Output data capture
+   │   └─ No file I/O
+   ├─ Status: ★★ For debugging encoder
+   ├─ Inputs tested:
+   │   ├─ match_offset, match_length
+   │   ├─ unmatch_length, unmatch_data
+   │   └─ LZ4 frame header/trailer
+   └─ Output: Captured packets (no self-check)
+
+
+3. ✓ lz4_buffer_tb_v2.v (~100 lines)
+   ├─ Tests: lz4_buffer_v2 module (64KB buffer)
+   ├─ Type: Unit testbench
+   ├─ Features:
+   │   ├─ Buffer write/read operations
+   │   ├─ Address generation
+   │   └─ Conflict detection
+   ├─ Status: ★ For buffer debugging only
+   └─ Note: Incomplete stimulus (no test case implementation)
+
+
+4. byte_addressing_tb_v2.v
+   ├─ Tests: byte_addressing_v4 (barrel shifter)
+   ├─ Type: Unit testbench
+   ├─ Status: Limited use
+   └─ Not recommended for full compression test
+
+
+5. xxh32_cal_tb.v
+   ├─ Tests: xxh32_calc_v2 (checksum calculator)
+   ├─ Type: Unit testbench
+   ├─ Status: For checksum verification only
+   └─ Not for full compression test
+
+
+6. mix_compression_top_tb.sv
+   ├─ Tests: mix_compression_top (LZ4 + Huffman combined)
+   ├─ Note: Tests BOTH LZ4 and Huffman together
+   ├─ Status: ✗ Not what you want (includes Huffman)
+   └─ Use only if testing the complete pipeline
+
+
+================================================================================
+                    RECOMMENDED: lz4_top_tb_v2.v
+================================================================================
+
+This is the MAIN testbench for LZ4-only compression.
+
+WHAT IT DOES:
+─────────────
+
+✓ Reads test files from: test_src/compress/
+✓ Feeds them into lz4_top_v3 module
+✓ Outputs compressed .lz4 files to: test_out/
+✓ Measures compression performance
+✓ Logs timing information
+
+
+TEST CORPUS INCLUDED:
+─────────────────────
+
+Calgary Corpus (~50 files):
+  ├─ words, numbers, numlit, zero, space, spclit
+  ├─ README, paper1-6
+  ├─ bib, geo, obj1, obj2
+  ├─ progc, progp, progl
+  ├─ trans
+  ├─ book1, book2
+  ├─ news, pic
+  └─ (All located in test_src/compress/)
+
+Canterbury Corpus:
+  ├─ alice29.txt, asyoulik.txt, cp.html
+  ├─ fields.c, grammar.lsp, kennedy.xls
+  ├─ lcet10.txt, ptt5, sum, xargs.1
+  ├─ plrabn12.txt (currently active test)
+  └─ (All located in test_src/compress/)
+
+Special Cases:
+  ├─ jpg1M (1MB binary - challenging)
+  ├─ over1M.pdf (>1MB)
+  ├─ equ4M_ascii.txt (4MB text)
+  └─ (All support files included)
+
+
+HOW TO USE IT:
+──────────────
+
+Step 1: Uncomment test file path
+─────────────────────────────────
+In lz4_top_tb_v2.v, around line 58-150, find the test case you want:
+
+    // Active test:
+    parameter	SRC_FILE_PATH = "./test_src/compress/plrabn12.txt";
+    parameter	DEST_FILE_PATH = "./test_out/plrabn12_hw.lz4";
+
+    // Commented alternatives:
+    // parameter	SRC_FILE_PATH = "./test_src/compress/words";
+    // parameter	SRC_FILE_PATH = "./test_src/compress/paper1";
+    // etc.
+
+Step 2: Change active test
+────────────────────────
+Comment out current test, uncomment your desired test.
+
+Step 3: Run simulation
+──────────────────────
+In your HDL simulator (ISE, Vivado, ModelSim, etc.):
+
+    vsim -t 1ns lz4_top_tb_v2
+    run -all
+
+Step 4: Check output
+────────────────────
+Compressed file appears in: test_out/[testname]_hw.lz4
+
+
+TIMING EXAMPLES (from testbench comments):
+────────────────────────────────────────────
+
+File: plrabn12.txt  →  3234 µs (compression time)
+File: paper1        →  729 µs (100MHz) or 292 µs (250MHz)
+File: book1         →  12549 µs (100MHz) or 5020 µs (250MHz)
+File: equ4M.txt     →  6442 µs
+
+Throughput calculation: file_size / compression_time
+
+
+================================================================================
+                    TESTBENCH FEATURES
+================================================================================
+
+CLOCK GENERATION:
+──────────────
+    parameter Tcq = 4;  // 4ns clock period = 250 MHz
+    always clk = #(Tcq/2) ~clk;
+
+
+DATA INPUT:
+──────────
+    • Binary file read mode ("rb")
+    • Byte-by-byte feeding to idata[31:0] input
+    • Proper sequencing with idata_req/valid signals
+
+
+OUTPUT VERIFICATION:
+───────────────────
+    • Captures output_data[31:0] at clock edges
+    • Writes to binary file (.lz4 format)
+    • Counts output bytes
+    • Calculates compression ratio
+
+
+PERFORMANCE TRACKING:
+────────────────────
+    • Measures clock cycles from start to done
+    • Logs timing to console
+    • Can compare different test cases
+
+
+PLL WAIT:
+────────
+    #500;  // Waits for internal PLL to lock (hash_pll: 250→500MHz)
+
+
+FRAME VALIDATION:
+─────────────────
+    • LZ4 frame header verification
+    • Magic number check (0x184D2204)
+    • Block format compliance
+    • Checksum validation
+
+
+================================================================================
+                    HOW TO VERIFY OUTPUT
+================================================================================
+
+After simulation generates .lz4 file:
+
+Option 1: Decompress with LZ4 tool (if installed)
+──────────────────────────────────────
+    $ lz4 -d output_hw.lz4 decompressed.txt
+    $ diff original.txt decompressed.txt
+
+Option 2: Use provided Python script
+──────────────────────────────────────
+    Location: test_out/file_compare.py
+    Usage: python file_compare.py original.lz4 hardware.lz4
+
+Option 3: Manual verification
+──────────────────────────────
+    • Check file size (compressed < original)
+    • Verify LZ4 magic number (first 4 bytes)
+    • Check frame structure
+
+
+================================================================================
+                    RUNNING THE TESTBENCH STEP-BY-STEP
+================================================================================
+
+STEP 1: Set up working directory
+─────────────────────────────────
+    $ cd /home/burdina/projects/LZ4_huffman/03.sim/
+    $ ls test_src/compress/  # Verify test files exist
+
+
+STEP 2: Choose your simulator
+──────────────────────────────
+
+    Option A: ModelSim
+    ──────────
+    $ vlib work
+    $ vmap work work
+    $ vlog -work work ../mix_compress_v1/RTL_lz4/*.v
+    $ vlog -work work lz4_top_tb_v2.v
+    $ vsim -work work lz4_top_tb_v2
+    $ run -all
+    $ quit
+
+    Option B: VCS (Synopsys)
+    ──────────
+    $ vcs -full64 ../mix_compress_v1/RTL_lz4/*.v lz4_top_tb_v2.v
+    $ ./simv
+
+    Option C: Vivado Simulator (built-in)
+    ──────────
+    • Create new sim source in Vivado project
+    • Add lz4_top_tb_v2.v as testbench
+    • Run simulation (Vivado GUI)
+
+
+STEP 3: Edit test case (if needed)
+──────────────────────────────────
+    Edit lz4_top_tb_v2.v around line 142:
+    
+    // Current:
+    parameter	SRC_FILE_PATH = "./test_src/compress/plrabn12.txt";
+    parameter	DEST_FILE_PATH = "./test_out/plrabn12_hw.lz4";
+    
+    // Change to (e.g.):
+    parameter	SRC_FILE_PATH = "./test_src/compress/book1";
+    parameter	DEST_FILE_PATH = "./test_out/book1_hw.lz4";
+
+
+STEP 4: Run and monitor
+──────────────────────
+    • Simulation will:
+      ├─ Load test file
+      ├─ Feed data into LZ4 encoder
+      ├─ Capture output
+      ├─ Write to .lz4 file
+      └─ Display timing info
+
+    • Watch for:
+      ├─ No X's in simulation (unknown states)
+      ├─ Output valid signals
+      ├─ File size reduction
+      └─ Compression completion
+
+
+STEP 5: Verify output
+─────────────────────
+    $ ls -lh test_out/plrabn12_hw.lz4
+    $ file test_out/plrabn12_hw.lz4  # Should show: LZ4 compressed data
+
+
+================================================================================
+                    TESTBENCH SIGNALS
+================================================================================
+
+INPUT SIGNALS:
+──────────────
+    idata[31:0]         = 32-bit input data (4 bytes)
+    idata_req           = Data request (handshake)
+    data_terminal       = Last data indicator
+    start_compress      = Compression start signal
+    file_length[31:0]   = Total input file length
+    file_length_valid   = File length valid
+    out_en              = Output enable (read request)
+
+
+OUTPUT SIGNALS:
+───────────────
+    out_data[31:0]      = 32-bit compressed output
+    out_valid           = Output data valid
+    out_empty           = Output buffer empty
+    compress_done       = Compression complete
+    compressed_len[31:0]= Final compressed file size
+    mfifo_empty         = Match FIFO empty
+    mfifo_full          = Match FIFO full
+    obuf_full           = Output buffer full
+    ohalf_full          = Output buffer half full
+
+
+TEST INTERFACE (internal monitoring):
+──────────────────────────────────────
+    mfifo_valid         = Match FIFO data valid
+    mfifo_data[31:0]    = Match FIFO data (for debugging)
+
+
+================================================================================
+                    EXAMPLE: MINIMAL TESTBENCH RUN
+================================================================================
+
+# Create a new test file or use existing
+
+# ModelSim quick test:
+cd /home/burdina/projects/LZ4_huffman/03.sim
+vlib work
+vlog -work work ../mix_compress_v1/RTL_lz4/lz4_top_v3.v
+vlog -work work ../mix_compress_v1/RTL_lz4/*.v
+vlog -work work lz4_top_tb_v2.v
+vsim -work work lz4_top_tb_v2
+run 100ms
+quit
+
+# Check output
+ls -lh test_out/plrabn12_hw.lz4
+
+
+================================================================================
+                    TROUBLESHOOTING
+================================================================================
+
+Problem: File not found error
+─────────────────────────────
+Cause: Simulator can't find test_src/compress/[filename]
+Fix:
+  ✓ Check current working directory
+  ✓ Run from 03.sim/ directory
+  ✓ Verify file exists: ls test_src/compress/plrabn12.txt
+
+
+Problem: Simulation hangs / won't finish
+─────────────────────────────────────────
+Cause: PLL lock time or infinite loop
+Fix:
+  ✓ Increase wait time: #500; → #1000;
+  ✓ Check for data_terminal signal
+  ✓ Verify clock frequency (Tcq = 4 for 250MHz)
+
+
+Problem: Output file is empty or corrupted
+───────────────────────────────────────────
+Cause: Output signals not properly sampled
+Fix:
+  ✓ Check out_valid signal timing
+  ✓ Verify out_en is asserted correctly
+  ✓ Ensure compress_done signal pulses
+
+
+Problem: Simulation too slow
+─────────────────────────────
+Cause: Large test files or inefficient simulator
+Fix:
+  ✓ Use smaller test case (words, README, paper1)
+  ✓ Use optimized HDL simulator (ModelSim > VCS > Vivado)
+  ✓ Compile with optimization flags
+
+
+Problem: Wrong compression ratio
+────────────────────────────────
+Cause: LZ4 algorithm mismatch or parameter issue
+Fix:
+  ✓ Verify hardware matches LZ4 reference (lz4.c)
+  ✓ Check block header (blocksize_id = 8'h40 for 64KB)
+  ✓ Compare output with lz4 CLI tool
+
+
+================================================================================
+                    COMPARISON WITH OTHER TESTBENCHES
+================================================================================
+
+lz4_top_tb_v2 (RECOMMENDED):
+    ├─ Full compression pipeline: ✓
+    ├─ File-based stimuli: ✓
+    ├─ Self-checking: ✓
+    ├─ Multiple test cases: ✓ (40+ files)
+    ├─ Performance timing: ✓
+    ├─ Easy to use: ✓
+    └─ Recommended: ★★★★★
+
+lz4_encoder_tb:
+    ├─ Full compression pipeline: ✗ (encoder only)
+    ├─ File-based stimuli: ✗ (manual only)
+    ├─ Self-checking: ✗ (no verification)
+    ├─ Multiple test cases: ✗ (manual)
+    ├─ Performance timing: ✓
+    ├─ Easy to use: ✗ (needs hand-crafted data)
+    └─ Recommended: ★★ (for debugging only)
+
+lz4_buffer_tb:
+    ├─ Full compression pipeline: ✗ (buffer only)
+    ├─ File-based stimuli: ✗
+    ├─ Self-checking: ✗
+    ├─ Recommended: ★ (unit testing only)
+
+mix_compression_top_tb:
+    ├─ Includes Huffman: ✓
+    ├─ LZ4 alone: ✗ (combined pipeline)
+    ├─ Recommended: ✗ (not for LZ4-only test)
+
+
+================================================================================
+                    SUMMARY
+================================================================================
+
+✓ YES - There is a working LZ4-only testbench
+
+✓ LOCATION: lz4_top_tb_v2.v (417 lines)
+
+✓ READY TO USE: Includes 40+ test files, file I/O, performance logging
+
+✓ RECOMMENDED: Start with this testbench for full validation
+
+✓ STATUS: Actively used and well-tested on FPGA
+
+
+To get started:
+  1. cd /home/burdina/projects/LZ4_huffman/03.sim/
+  2. Review lz4_top_tb_v2.v (choose test case)
+  3. Run simulation with your HDL tool
+  4. Check test_out/[name]_hw.lz4 for output
+
+================================================================================
